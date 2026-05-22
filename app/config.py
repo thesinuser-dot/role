@@ -73,6 +73,50 @@ class Config:
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     ]
 
+    # ── Target accounts whitelist (Faceless / Edit accounts) ──────────────────
+    # Add Instagram usernames you want the bot to scrape — one per line, no @.
+    # Set via the USERS_ATTACK env-var (newline- or comma-separated) or add
+    # them directly in the list below.  Leave empty to use the normal feed.
+    USERS_ATTACK: List[str] = [
+        u.strip().lstrip("@")
+        for u in os.environ.get(
+            "USERS_ATTACK",
+            # ── Default seed accounts ──────────────────────────────────────
+            # Add or remove usernames here:
+            "\n".join([
+                "thebl00dz",
+                # "username2",
+                # "username3",
+            ])
+        ).replace(",", "\n").splitlines()
+        if u.strip()
+    ]
+
+    # ── Caption / hashtag content filter ──────────────────────────────────────
+    # Words found in captions or hashtags that immediately disqualify a reel.
+    CAPTION_BLACKLIST: List[str] = [
+        w.strip()
+        for w in os.environ.get(
+            "CAPTION_BLACKLIST",
+            "POV,Vlog,Day in my life,OOTD,Outfit of the day,GRWM,"
+            "Get ready with me,Selfie,My girlfriend,My boyfriend,Travel vlog,"
+            "storytime,come with me,day with me,morning routine,night routine",
+        ).split(",")
+        if w.strip()
+    ]
+
+    # Words found in captions or hashtags that mark a reel as a desirable Edit.
+    CAPTION_WHITELIST: List[str] = [
+        w.strip()
+        for w in os.environ.get(
+            "CAPTION_WHITELIST",
+            "Movie edit,Scene pack,Anime edit,Car community,M5 f10,"
+            "Sigma edit,Quote of the day,Relatable quotes,edit,cinematic,"
+            "aesthetic,motivation,fyp edit,car edit",
+        ).split(",")
+        if w.strip()
+    ]
+
     # ── Vision / black-bar detection ───────────────────────────────────────────
     BLACK_THRESHOLD: int = int(os.environ.get("BLACK_THRESHOLD", "28"))
     BLACK_BAR_RATIO: float = float(os.environ.get("BLACK_BAR_RATIO", "0.82"))
@@ -80,6 +124,7 @@ class Config:
 
     @classmethod
     def summary(cls) -> str:
+        users_str = ", ".join(cls.USERS_ATTACK) if cls.USERS_ATTACK else "(feed mode)"
         lines = [
             "+- Config ---------------------------------------------------",
             f"|  Max runtime        : {cls.MAX_RUNTIME_SECONDS}s (buffer {cls.SHUTDOWN_BUFFER_SECONDS}s)",
@@ -97,6 +142,9 @@ class Config:
             f"|  Proxy enabled      : {cls.USE_PROXY}",
             f"|  Proxy mode         : {cls.WEBSHARE_PROXY_MODE}",
             f"|  Webshare key set   : {bool(cls.WEBSHARE_API_KEY)}",
+            f"|  Target accounts    : {users_str}",
+            f"|  Caption blacklist  : {len(cls.CAPTION_BLACKLIST)} words",
+            f"|  Caption whitelist  : {len(cls.CAPTION_WHITELIST)} words",
             "+------------------------------------------------------------",
         ]
         return "\n".join(lines)
