@@ -340,6 +340,53 @@ class InstagramAgent:
 
     # ── Setup ─────────────────────────────────────────────────────────────────
 
+    def _switch_to_rdp_display_if_available(self) -> bool:
+        """
+        Detect a live XRDP X display (:10 or higher) and set DISPLAY to it.
+
+        Called before bm.launch() so the browser opens directly on the user's
+        RDP screen — no need to send /startdisplay after connecting.
+
+        Returns True if an RDP display was found and DISPLAY was updated.
+        """
+        import subprocess as _sp
+        import time as _time
+
+        # Poll for up to 30s in case XRDP is still starting when agent boots
+        for attempt in range(6):
+            try:
+                sockets = _sp.run(
+                    ["ls", "/tmp/.X11-unix/"],
+                    capture_output=True, text=True, timeout=5,
+                ).stdout.splitlines()
+                for entry in sorted(sockets):
+                    entry = entry.strip()
+                    if entry.startswith("X"):
+                        num_str = entry[1:]
+                        if num_str.isdigit() and int(num_str) >= 10:
+                            rdp_display = f":{num_str}"
+                            current = os.environ.get("DISPLAY", "")
+                            if current != rdp_display:
+                                os.environ["DISPLAY"] = rdp_display
+                                self.log.info(
+                                    f"Auto-detected RDP display {rdp_display} "
+                                    f"(was {current!r}) — browser will open on your screen."
+                                )
+                            else:
+                                self.log.info(f"RDP display already set: {rdp_display}")
+                            return True
+            except Exception as exc:
+                self.log.debug(f"RDP display probe attempt {attempt+1} failed: {exc}")
+
+            if attempt < 5:
+                self.log.debug(f"No RDP display yet (attempt {attempt+1}/6) — waiting 5s…")
+                _time.sleep(5)
+
+        self.log.info(
+            f"No RDP display found — using DISPLAY={os.environ.get('DISPLAY', ':99')} (Xvfb)"
+        )
+        return False
+
     def setup(self) -> bool:
         self.log.info("\n" + Config.summary())
 
@@ -357,6 +404,12 @@ class InstagramAgent:
                 f"Failed to write Netscape cookies file "
                 f"(yt-dlp will run without auth):\n{traceback.format_exc()}"
             )
+
+        # ── Auto-detect RDP display before launching browser ──────────────────
+        # If an XRDP session is already live (display :10+), use it so the
+        # browser appears on screen immediately without needing /startdisplay.
+        # Falls back to DISPLAY env var (Xvfb :99) if no RDP session yet.
+        self._switch_to_rdp_display_if_available()
 
         try:
             self.bm.launch()
@@ -416,14 +469,20 @@ class InstagramAgent:
             self.db.mark_processed(reel_id, reel_url, "error", 0, 0, str(exc)[:200])
             return
 
-        # Wait for video — non-fatal if absent
+        # Wait for video + network idle so lazy stats have time to load
         try:
             page.wait_for_selector("video", timeout=10_000)
-            self.bm.delay(1500, 2500)
         except PlaywrightTimeout:
             self.log.warning(f"[{reel_id}] No <video> element within 10s — continuing.")
         except PlaywrightError as exc:
             self.log.warning(f"[{reel_id}] wait_for_selector error (non-fatal): {exc}")
+
+        # Wait for network to settle — Instagram stats are lazy-loaded via XHR
+        try:
+            page.wait_for_load_state("networkidle", timeout=8_000)
+        except Exception:
+            pass  # non-fatal
+        self.bm.delay(2500, 3500)
 
         # ── 2. Metrics ────────────────────────────────────────────────────────
         try:
