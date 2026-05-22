@@ -519,7 +519,7 @@ class ReelCollector:
 
     # ── Reel URL collection ───────────────────────────────────────────────────
 
-    def collect_reel_urls(self, notifier=None) -> List[str]:
+    def collect_reel_urls(self, notifier=None, stop_fn=None) -> List[str]:
         """
         Collect reel URLs via ArrowDown keyboard navigation.
         """
@@ -623,6 +623,12 @@ class ReelCollector:
 
         for step in range(max_steps):
             if len(collected) >= Config.TARGET_REELS_SCAN:
+                break
+            if stop_fn is not None and stop_fn():
+                self.log.info(
+                    f"/skip received — stopping collection early "
+                    f"({len(collected)} URL(s) collected so far)."
+                )
                 break
 
             prev_url = self._page.url
