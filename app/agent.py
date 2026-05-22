@@ -99,6 +99,7 @@ class TelegramCommandPoller:
         "/setviews &lt;n&gt; — set minimum view count\n"
         "/setscans &lt;n&gt; — set reels-to-scan per run\n"
         "/setsend &lt;n&gt; — set max reels sent per run\n"
+        "/skip — stop collecting reels now; proceed to download + Gemini stage\n"
     )
 
     def __init__(self, bot_token: str, chat_id: str, cmd_queue: queue.Queue):
@@ -247,6 +248,7 @@ class InstagramAgent:
         self.sent     = 0
         self._stop    = False
         self._hunting = False
+        self._skip_collection = False   # set True by /skip to stop URL collection early
 
         # ── Telegram command machinery ─────────────────────────────────────────
         self._cmd_queue: queue.Queue = queue.Queue()
@@ -628,7 +630,11 @@ class InstagramAgent:
                 self.notifier.send_message("❌ Hunt aborted: could not access Reels feed.")
                 return
 
-            reel_urls = self.collector.collect_reel_urls(self.notifier)
+            reel_urls = self.collector.collect_reel_urls(
+                self.notifier,
+                stop_fn=lambda: self._skip_collection,
+            )
+            self._skip_collection = False  # reset for any future hunt
             if not reel_urls:
                 self.log.warning("No Reel URLs collected.")
                 self.notifier.send_message("⚠️ No Reels found in this run.")
@@ -903,6 +909,19 @@ class InstagramAgent:
             except Exception as exc:
                 self.log.exception("/startdisplay handler error")
                 reply(f"❌ /startdisplay error: {exc}")
+
+        elif cmd == "/skip":
+            if not self._hunting:
+                reply("⚠️ No hunt is running right now — nothing to skip.")
+            elif self._skip_collection:
+                reply("⏩ Skip already requested — collection will stop on the next step.")
+            else:
+                self._skip_collection = True
+                reply(
+                    "⏩ <b>Skip requested</b> — URL collection will stop after the current "
+                    "step and the download + Gemini stage will begin immediately with the "
+                    "reels collected so far."
+                )
 
         else:
             reply(f"❓ Unknown command: <code>{cmd}</code>  Try /help")
