@@ -33,6 +33,22 @@ from playwright.sync_api import (
 )
 
 from config import Config
+from proxy_pool import ProxyPool
+
+# ── Module-level proxy pool (initialised once, shared across BrowserManager instances) ──
+_proxy_pool: Optional[ProxyPool] = None
+
+def get_proxy_pool() -> Optional[ProxyPool]:
+    """Return the module-level ProxyPool, creating it on first call if proxies are enabled."""
+    global _proxy_pool
+    if not Config.USE_PROXY:
+        return None
+    if _proxy_pool is None:
+        _proxy_pool = ProxyPool(
+            api_key=Config.WEBSHARE_API_KEY,
+            mode=Config.WEBSHARE_PROXY_MODE,
+        )
+    return _proxy_pool
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -220,6 +236,7 @@ class BrowserManager:
         self._page:    Optional[Page]            = None
         self._trace_dir: Optional[Path]          = None
         self._canvas_seed: int = random.randint(1, 0x7FFFFFFF)
+        self._active_proxy: Optional[dict] = None  # currently-used proxy dict
 
     # ── Public properties ─────────────────────────────────────────────────────
 
@@ -330,9 +347,21 @@ class BrowserManager:
         if cookies is None:
             cookies = self._parse_cookies(Config.INSTAGRAM_SESSION_COOKIES)
         ua = random.choice(Config.USER_AGENTS)
+
+        # ── Proxy selection ────────────────────────────────────────────────────
+        pool = get_proxy_pool()
+        self._active_proxy = pool.get_random() if pool else None
+        if self._active_proxy:
+            self.log.info(f"Using proxy: {self._active_proxy['server']}")
+        else:
+            self.log.info("No proxy in use (pool empty or disabled)")
+
         self.log.info(f"Launching Chromium (headless={Config.HEADLESS}) UA={ua[:60]}...")
         self._pw = sync_playwright().start()
+        # Use system Chromium (with H.264/AAC codecs) when available in container
+        _chromium_exe = os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")
         self._browser = self._pw.chromium.launch(
+            executable_path=_chromium_exe or None,
             headless=Config.HEADLESS,
             args=[
                 "--no-sandbox",
@@ -378,6 +407,7 @@ class BrowserManager:
             device_scale_factor=2.0,
             permissions=["notifications"],
             ignore_https_errors=True,
+            **({"proxy": self._active_proxy} if self._active_proxy else {}),
         )
         self._ctx.add_init_script(_build_stealth_script(self._canvas_seed))
         if cookies:
@@ -436,6 +466,24 @@ class BrowserManager:
                 self.log.debug(f"Closed: {name}")
             except Exception as exc:
                 self.log.warning(f"Error closing {name}: {exc}")
+
+        # ── Proxy feedback ─────────────────────────────────────────────────────
+        # mark_proxy_success() / mark_proxy_failed() should be called by the
+        # caller BEFORE close() when they know whether the session worked.
+        # close() itself just cleans up resources.
+
+    def mark_proxy_success(self) -> None:
+        """Tell the pool the current proxy worked fine."""
+        pool = get_proxy_pool()
+        if pool and self._active_proxy:
+            pool.mark_success(self._active_proxy)
+
+    def mark_proxy_failed(self) -> None:
+        """Tell the pool the current proxy failed; it may be quarantined."""
+        pool = get_proxy_pool()
+        if pool and self._active_proxy:
+            pool.mark_failed(self._active_proxy)
+            self.log.warning(f"Marked proxy as failed: {self._active_proxy.get('server')}")
 
     # ── Human-like interaction ────────────────────────────────────────────────
 
