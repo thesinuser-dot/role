@@ -779,27 +779,62 @@ class InstagramAgent:
                 reply("❌ Usage: <code>/setsend 5</code>")
 
         elif cmd in ("/startdisplay", "/desktop", "/resumerdp"):
-            reply("🖥️ Raising Chromium window...")
+            reply("🖥️ Detecting RDP display and relaunching browser on it...")
             try:
-                raised = self.bm.raise_chromium_window()
-                if raised:
-                    reply("✅ Window raised. Connect via Xpra to see the desktop.")
+                import subprocess as _sp
+                # Find the XRDP display (always :10 or higher)
+                sockets = _sp.run(
+                    ["ls", "/tmp/.X11-unix/"],
+                    capture_output=True, text=True, timeout=5,
+                ).stdout.splitlines()
+                rdp_display = None
+                for entry in sorted(sockets):
+                    entry = entry.strip()
+                    if entry.startswith("X"):
+                        num_str = entry[1:]
+                        if num_str.isdigit() and int(num_str) >= 10:
+                            rdp_display = f":{num_str}"
+                            break
+
+                if rdp_display:
+                    self.log.info(f"/startdisplay: found RDP display {rdp_display}")
+                    reply(f"🖥️ Found RDP display <code>{rdp_display}</code> — relaunching browser on it…")
+                    # Close existing browser on the old display
+                    try:
+                        self.bm.close()
+                    except Exception as close_exc:
+                        self.log.warning(f"Browser close before relaunch: {close_exc}")
+                    # Switch display and relaunch
+                    os.environ["DISPLAY"] = rdp_display
+                    self.bm.launch()
+                    # Navigate back to current reel or feed
+                    try:
+                        self.bm.page.goto(
+                            "https://www.instagram.com/reels/",
+                            wait_until="domcontentloaded", timeout=20_000,
+                        )
+                    except Exception:
+                        pass
+                    reply("✅ Browser relaunched on your RDP screen — you should see it now.")
                     try:
                         snap = self.bm.page.screenshot(type="jpeg", quality=75)
-                        self.notifier.send_photo(snap, caption="🖥️ Current browser view")
+                        self.notifier.send_photo(snap, caption="🖥️ Browser is live on your RDP screen")
                     except PlaywrightError as exc:
-                        self.log.debug(f"Post-raise screenshot failed: {exc}")
+                        self.log.debug(f"Post-relaunch screenshot failed: {exc}")
                 else:
-                    reply("⚠️ Could not raise window — see agent logs for X window list.")
+                    # No RDP display found — try legacy raise on current display
+                    reply("⚠️ No RDP display found yet — is your RDP session connected?")
+                    raised = self.bm.raise_chromium_window()
                     try:
                         snap = self.bm.page.screenshot(type="jpeg", quality=75)
                         self.notifier.send_photo(
                             snap,
-                            caption=f"🖥️ Playwright view\n<code>{self.bm.page.url}</code>",
+                            caption=f"🖥️ Playwright view (display: {os.environ.get('DISPLAY', '?')})\n<code>{self.bm.page.url}</code>",
                         )
                     except PlaywrightError as exc:
-                        reply(f"Screenshot also failed: {exc}")
+                        reply(f"Screenshot failed: {exc}")
             except Exception as exc:
+                self.log.exception("/startdisplay handler error")
                 reply(f"❌ /startdisplay error: {exc}")
 
         else:
