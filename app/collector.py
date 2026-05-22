@@ -2,14 +2,16 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # collector.py — Instagram Reel URL collection and metrics extraction
 #
+# Key fix (2026-05): Instagram changed "X views" → "X plays" for Reels.
+#   All extraction strategies (JS, aria-label, text-node walk, CSS selectors)
+#   now handle BOTH "views" and "plays" so view counts are never 0.
+#
 # Key improvement: SelectorRegistry
 #   Instagram's DOM structure changes frequently.  Hard-coded single selectors
 #   break silently and the agent collects nothing.  SelectorRegistry holds a
 #   priority-ordered list for each DOM target; the first selector that returns
 #   a non-empty result wins.  When all selectors fail the failure is logged at
 #   WARNING level with the full selector list so it's easy to update.
-#
-# All exception paths log at least at DEBUG level — no more silent swallows.
 # ─────────────────────────────────────────────────────────────────────────────
 
 import logging
@@ -39,22 +41,27 @@ class SelectorRegistry:
     wins.  If all selectors fail, the caller receives an empty list and logs
     a WARNING with the full tried list so the fix is obvious.
 
-    Strategy: most-specific selectors (aria-label, data-* attributes) first;
-    broad tag-only selectors last.  Broad selectors are included as a last
-    resort so the agent degrades gracefully rather than silently collecting
-    nothing.
+    NOTE 2026-05: Instagram Reels now shows "X plays" instead of "X views".
+    All VIEW_COUNT selectors check both "plays" and "views".
     """
 
     VIEW_COUNT: List[str] = [
+        # ── "plays" selectors (Instagram Reels current label) ──
+        "[aria-label*='plays' i]",
+        "[aria-label*='play' i]",
+        "span[class*='play' i]",
+        "div[class*='play' i]",
+        # ── legacy "views" selectors ──
         "[aria-label*='views' i]",
         "[aria-label*='view' i]",
         "span[class*='view' i]",
         "div[class*='view' i]",
         "span[class*='View']",
+        # ── broad fallbacks ──
         "section span[class]",
         "main span[class]",
         "article span[class]",
-        "span",              # broad fallback — filtered by text content in caller
+        "span",              # filtered by text content in caller
     ]
 
     LIKE_COUNT: List[str] = [
@@ -202,12 +209,10 @@ class ReelCollector:
 
     def extract_metrics(self) -> Dict[str, int]:
         """
-        Extract view + like counts from the current reel page.
+        Extract view/play + like counts from the current reel page.
 
-        Instagram's engagement stats are lazy-loaded and often require:
-          - waiting for the network to settle (networkidle)
-          - scrolling the stats section into view so it renders
-          - multiple extraction attempts with increasing delays
+        IMPORTANT: Instagram Reels now displays "X plays" not "X views".
+        Both labels are handled throughout this method.
         """
         # Step 1: wait for network to settle so lazy JS has run
         try:
@@ -215,11 +220,10 @@ class ReelCollector:
         except Exception:
             pass  # non-fatal — proceed with whatever is loaded
 
-        # Step 2: scroll the like/view section into view to trigger lazy render
+        # Step 2: scroll the like/play section into view to trigger lazy render
         try:
             self._page.evaluate("""
                 () => {
-                    // Scroll to the bottom-right action bar where stats live
                     const candidates = [
                         ...document.querySelectorAll('section, [role="main"]'),
                     ];
@@ -239,14 +243,14 @@ class ReelCollector:
                 self.log.debug(f"JS view extraction got 0 (attempt {attempt+1}) — trying CSS fallback")
                 views = self._extract_count(
                     SelectorRegistry.VIEW_COUNT,
-                    keyword="view",
+                    keywords=["view", "play"],
                     exclude=None,
                     label="views",
                 )
 
             likes = self._extract_count(
                 SelectorRegistry.LIKE_COUNT,
-                keyword="like",
+                keywords=["like"],
                 exclude="unlike",
                 label="likes",
             )
@@ -255,10 +259,8 @@ class ReelCollector:
                 break
 
             if attempt == 0:
-                # Stats still 0 — wait longer and retry once
                 self.log.debug("Stats still 0 — waiting 4s and retrying extraction")
                 self._bm.delay(3500, 4500)
-                # Try scrolling the page a bit to trigger render
                 try:
                     self._page.mouse.wheel(0, 300)
                     self._bm.delay(500, 800)
@@ -271,22 +273,24 @@ class ReelCollector:
 
     def _extract_views_js(self) -> int:
         """
-        Multi-strategy JS extraction for view count.
+        Multi-strategy JS extraction for view/play count.
 
-        Instagram frequently changes its DOM structure.  We try 5 strategies
-        in order of reliability:
-          1. window.__additionalData / window._sharedData (API response cached in page)
-          2. <meta> / <script type="application/ld+json"> structured data
-          3. aria-label attributes containing "X views"
-          4. Text-node walk: single node "1.2M views"
-          5. Text-node walk: number node followed by "views" node nearby
+        FIX 2026-05: Instagram Reels changed "views" label to "plays".
+        All text-based strategies now check BOTH "views" and "plays".
+
+        Strategies (most-reliable first):
+          1. window.__additionalData / window._sharedData (API response in page)
+          2. Inline <script> JSON blobs — play_count / video_view_count
+          3. aria-label attributes containing "X plays" OR "X views"
+          4. Text-node walk: single node "1.2M plays" or "1.2M views"
+          5. Text-node walk: number node followed by "plays"/"views" node nearby
+          6. window.__bbox (newer IG data container)
         """
         try:
             raw = self._page.evaluate("""
                 () => {
                     // ── Strategy 1: Instagram's in-page data objects ──────────────────
                     try {
-                        // Modern IG stores media data in __additionalData keyed by path
                         if (window.__additionalData) {
                             const vals = Object.values(window.__additionalData);
                             for (const v of vals) {
@@ -317,22 +321,22 @@ class ReelCollector:
                         const scripts = document.querySelectorAll('script[type="application/json"], script:not([src])');
                         for (const s of scripts) {
                             const txt = s.textContent || '';
-                            // look for video_view_count or play_count near a number
-                            const m = /"(?:video_view_count|play_count|video_play_count)"\s*:\s*(\d+)/.exec(txt);
+                            const m = /\"(?:video_view_count|play_count|video_play_count|view_count)\"\\s*:\\s*(\\d+)/.exec(txt);
                             if (m && parseInt(m[1]) > 0) return m[1];
                         }
                     } catch(e) {}
 
-                    // ── Strategy 3: aria-label containing "X views" ───────────────────
+                    // ── Strategy 3: aria-label "X plays" OR "X views" ─────────────────
                     try {
                         for (const el of document.querySelectorAll('[aria-label]')) {
                             const label = el.getAttribute('aria-label') || '';
-                            const m = /([\d,]+\.?\d*\s*[KMBkmb]?)\s+views?/i.exec(label);
+                            // Match "X plays" or "X views" (Instagram uses "plays" for Reels)
+                            const m = /([\\d,]+\\.?\\d*\\s*[KMBkmb]?)\\s+(?:plays?|views?)/i.exec(label);
                             if (m) return m[1];
                         }
                     } catch(e) {}
 
-                    // ── Strategy 4 & 5: text-node walk ───────────────────────────────
+                    // ── Strategy 4 & 5: text-node walk (plays OR views) ───────────────
                     try {
                         const walker = document.createTreeWalker(
                             document.body, NodeFilter.SHOW_TEXT, null, false
@@ -344,19 +348,28 @@ class ReelCollector:
                             if (t) texts.push(t);
                         }
 
-                        // Single node: "1.2M views"
+                        // Single node: "1.2M plays" or "1.2M views"
                         for (const t of texts) {
-                            const m = /^([\d,]+\.?\d*\s*[KMBkmb]?)\s+views?$/i.exec(t);
+                            const m = /^([\\d,]+\\.?\\d*\\s*[KMBkmb]?)\\s+(?:plays?|views?)$/i.exec(t);
                             if (m) return m[1];
                         }
 
-                        // Separate nodes: number then "views" within 4 positions
+                        // Separate nodes: number then "plays" or "views" within 4 positions
                         for (let i = 0; i < texts.length - 1; i++) {
                             const nearby = [texts[i+1], texts[i+2], texts[i+3]].filter(Boolean);
-                            if (nearby.some(t => /^views?$/i.test(t))) {
-                                const m = /^([\d,]+\.?\d*\s*[KMBkmb]?)$/.exec(texts[i]);
+                            if (nearby.some(t => /^(?:plays?|views?)$/i.test(t))) {
+                                const m = /^([\\d,]+\\.?\\d*\\s*[KMBkmb]?)$/.exec(texts[i]);
                                 if (m) return m[1];
                             }
+                        }
+                    } catch(e) {}
+
+                    // ── Strategy 6: window.__bbox (newer IG data container) ───────────
+                    try {
+                        if (window.__bbox && window.__bbox.define) {
+                            const str = JSON.stringify(window.__bbox);
+                            const m = /\"(?:video_view_count|play_count)\":(\\d+)/.exec(str);
+                            if (m && parseInt(m[1]) > 0) return m[1];
                         }
                     } catch(e) {}
 
@@ -374,10 +387,16 @@ class ReelCollector:
     def _extract_count(
         self,
         selector_list: List[str],
-        keyword: str,
+        keywords: List[str],
         exclude: Optional[str],
         label: str,
     ) -> int:
+        """
+        Extract a numeric count from DOM elements matching any of the given keywords.
+
+        `keywords` is a list — element text/aria-label must contain at least one.
+        This allows checking for both "view" and "play" in a single call.
+        """
         best = 0
         tried_selectors = 0
         for sel in selector_list:
@@ -391,7 +410,8 @@ class ReelCollector:
                         aria  = el.get_attribute("aria-label") or ""
                         inner = el.inner_text() or ""
                         combined = (aria + " " + inner).lower()
-                        if keyword not in combined:
+                        # Must match at least one keyword
+                        if not any(kw in combined for kw in keywords):
                             continue
                         if exclude and exclude in combined:
                             continue
@@ -456,7 +476,6 @@ class ReelCollector:
             url = self._page.url
             self.log.info(f"Landed on: {url}")
 
-            # Debug snapshot
             if notifier:
                 try:
                     snap = self._page.screenshot(type="jpeg", quality=70)
@@ -503,10 +522,6 @@ class ReelCollector:
     def collect_reel_urls(self, notifier=None) -> List[str]:
         """
         Collect reel URLs via ArrowDown keyboard navigation.
-
-        Instagram's SPA does not update the DOM with new reel URLs on scroll;
-        ArrowDown is the only reliable mechanism to advance the active reel
-        and get the URL bar to update.
         """
         seen: set = set()
         collected: List[str] = []
@@ -583,7 +598,6 @@ class ReelCollector:
         _capture_url_bar()
         _scrape_links()
 
-        # Initial state debug snapshot
         if notifier:
             try:
                 snap = self._page.screenshot(type="jpeg", quality=65)
@@ -629,7 +643,6 @@ class ReelCollector:
                     _scrape_links()
                     self._bm.delay(600, 1200)
 
-                    # Progress snapshot every 5 URLs collected
                     if (
                         len(collected) > 0
                         and len(collected) % 5 == 0
@@ -653,7 +666,6 @@ class ReelCollector:
                         f"Step {step}: URL unchanged (stuck={consecutive_stuck})"
                     )
 
-            # Stuck recovery
             if consecutive_stuck > 0 and consecutive_stuck % 3 == 0:
                 stuck_refocus_count += 1
                 self.log.info(
