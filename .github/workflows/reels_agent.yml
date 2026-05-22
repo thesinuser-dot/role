@@ -121,6 +121,12 @@ jobs:
 
           if not url:
               print("ERROR: Ngrok tunnel not found")
+              try:
+                  with open("/tmp/ngrok.log") as f:
+                      print("--- ngrok log ---")
+                      print(f.read()[-2000:])
+              except Exception as e:
+                  print(f"Could not read ngrok log: {e}")
               sys.exit(1)
 
           host = url.replace("tcp://", "").split(":")[0]
