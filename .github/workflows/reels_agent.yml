@@ -8,7 +8,7 @@ on:
       pause_for_rdp:
         description: "Pause before agent so you can RDP in first (yes/no)"
         required: false
-        default: "no"
+        default: "yes"
       min_views:
         description: "Minimum view count"
         required: false
@@ -360,19 +360,31 @@ jobs:
           TELEGRAM_BOT_TOKEN:        ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:          ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          # Check if /startdisplay was used — use that display
-          # Otherwise detect XRDP display, fallback to Xvfb
+          # ── Display resolution: prefer live RDP session ────────────────────
+          # /startdisplay wrote the display to file — use it directly
           if [[ -f /tmp/agent_display ]]; then
             export DISPLAY=$(cat /tmp/agent_display)
-            echo "Using display from /startdisplay command: $DISPLAY"
+            echo "Using display from /startdisplay: $DISPLAY"
           else
-            XRDP_DISPLAY=$(ls /tmp/.X11-unix/ 2>/dev/null \
-              | grep -E '^X[1-9][0-9]+' | head -1 | sed 's/^X/:/')
+            # Wait up to 30s for an XRDP session to appear (user may still be
+            # connecting when /resumeRDP fires and this step starts)
+            echo "Waiting up to 30s for RDP session..."
+            XRDP_DISPLAY=""
+            for i in $(seq 1 6); do
+              XRDP_DISPLAY=$(ls /tmp/.X11-unix/ 2>/dev/null                 | grep -E '^X[1-9][0-9]+' | head -1 | sed 's/^X/:/')
+              if [[ -n "$XRDP_DISPLAY" ]]; then
+                echo "RDP display found on attempt $i: $XRDP_DISPLAY"
+                break
+              fi
+              echo "  attempt $i/6 — no RDP display yet, waiting 5s..."
+              sleep 5
+            done
+
             if [[ -n "$XRDP_DISPLAY" ]]; then
               export DISPLAY="$XRDP_DISPLAY"
-              echo "Using XRDP display: $DISPLAY"
+              echo "Using RDP display: $DISPLAY"
             else
-              echo "No RDP session — using Xvfb headless fallback"
+              echo "No RDP session found — falling back to Xvfb headless"
               sudo apt-get install -y --no-install-recommends xvfb -qq 2>/dev/null
               Xvfb :99 -screen 0 1280x1024x24 &
               sleep 2
