@@ -342,49 +342,48 @@ class InstagramAgent:
 
     def _switch_to_rdp_display_if_available(self) -> bool:
         """
-        Detect a live XRDP X display (:10 or higher) and set DISPLAY to it.
+        Detect a live XRDP X display (:10+) and point DISPLAY at it.
 
-        Called before bm.launch() so the browser opens directly on the user's
-        RDP screen — no need to send /startdisplay after connecting.
-
-        Returns True if an RDP display was found and DISPLAY was updated.
+        The workflow's Run step already waits up to 60s for the display and
+        exports DISPLAY before launching python3.  So by the time we reach
+        here DISPLAY is almost certainly already correct — we just verify it
+        and log what we found.  If for some reason it's still pointing at
+        Xvfb (:99) we do a quick re-check of the socket directory.
         """
         import subprocess as _sp
-        import time as _time
+        import glob as _glob
 
-        # Poll for up to 30s in case XRDP is still starting when agent boots
-        for attempt in range(6):
-            try:
-                sockets = _sp.run(
-                    ["ls", "/tmp/.X11-unix/"],
-                    capture_output=True, text=True, timeout=5,
-                ).stdout.splitlines()
-                for entry in sorted(sockets):
-                    entry = entry.strip()
-                    if entry.startswith("X"):
-                        num_str = entry[1:]
-                        if num_str.isdigit() and int(num_str) >= 10:
-                            rdp_display = f":{num_str}"
-                            current = os.environ.get("DISPLAY", "")
-                            if current != rdp_display:
-                                os.environ["DISPLAY"] = rdp_display
-                                self.log.info(
-                                    f"Auto-detected RDP display {rdp_display} "
-                                    f"(was {current!r}) — browser will open on your screen."
-                                )
-                            else:
-                                self.log.info(f"RDP display already set: {rdp_display}")
-                            return True
-            except Exception as exc:
-                self.log.debug(f"RDP display probe attempt {attempt+1} failed: {exc}")
+        current = os.environ.get("DISPLAY", "")
 
-            if attempt < 5:
-                self.log.debug(f"No RDP display yet (attempt {attempt+1}/6) — waiting 5s…")
-                _time.sleep(5)
+        # If DISPLAY is already an RDP display (:10+), nothing to do
+        try:
+            num = int(current.lstrip(":"))
+            if num >= 10:
+                self.log.info(f"DISPLAY={current} is already the RDP session — good.")
+                return True
+        except (ValueError, AttributeError):
+            pass
 
-        self.log.info(
-            f"No RDP display found — using DISPLAY={os.environ.get('DISPLAY', ':99')} (Xvfb)"
-        )
+        # DISPLAY is :99 (Xvfb) or unset — do one quick socket scan
+        try:
+            sockets = _glob.glob("/tmp/.X11-unix/X*")
+            rdp_sockets = sorted(
+                [s for s in sockets
+                 if s.replace("/tmp/.X11-unix/X", "").isdigit()
+                 and int(s.replace("/tmp/.X11-unix/X", "")) >= 10]
+            )
+            if rdp_sockets:
+                num_str = rdp_sockets[0].replace("/tmp/.X11-unix/X", "")
+                rdp_display = f":{num_str}"
+                os.environ["DISPLAY"] = rdp_display
+                self.log.info(
+                    f"Switched DISPLAY from {current!r} → {rdp_display} (RDP session)"
+                )
+                return True
+        except Exception as exc:
+            self.log.debug(f"RDP socket scan failed: {exc}")
+
+        self.log.info(f"No RDP display found — using DISPLAY={current or ':99'} (Xvfb)")
         return False
 
     def setup(self) -> bool:
