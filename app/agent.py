@@ -847,7 +847,11 @@ class InstagramAgent:
                     entry = entry.strip()
                     if entry.startswith("X"):
                         num_str = entry[1:]
-                        if num_str.isdigit() and int(num_str) >= 10:
+                        # FIX Bug 2: XRDP sessions are :10–:50.
+                        # Xvfb fallback runs on :99 which also passes ">= 10",
+                        # making /startdisplay falsely think Xvfb is an RDP
+                        # session and relaunching on the same invisible display.
+                        if num_str.isdigit() and 10 <= int(num_str) <= 50:
                             rdp_display = f":{num_str}"
                             break
 
@@ -877,14 +881,22 @@ class InstagramAgent:
                     except PlaywrightError as exc:
                         self.log.debug(f"Post-relaunch screenshot failed: {exc}")
                 else:
-                    # No RDP display found — try legacy raise on current display
-                    reply("⚠️ No RDP display found yet — is your RDP session connected?")
-                    raised = self.bm.raise_chromium_window()
+                    # No XRDP display in range :10–:50 found.
+                    # Don't relaunch on Xvfb — that's invisible and misleads the user.
+                    current_disp = os.environ.get('DISPLAY', '?')
+                    reply(
+                        f"⚠️ No RDP session found (checked :10–:50 range).\n\n"
+                        f"Current display is <code>{current_disp}</code> "
+                        f"({'Xvfb — invisible' if current_disp in (':99', ':0') else 'unknown'}).\n\n"
+                        "Connect via RDP first, then send /startdisplay again."
+                    )
+                    # Still send a screenshot so the user can at least see what
+                    # Playwright is seeing, even if it's on Xvfb.
                     try:
                         snap = self.bm.page.screenshot(type="jpeg", quality=75)
                         self.notifier.send_photo(
                             snap,
-                            caption=f"🖥️ Playwright view (display: {os.environ.get('DISPLAY', '?')})\n<code>{self.bm.page.url}</code>",
+                            caption=f"👁️ Playwright view on <code>{current_disp}</code> (Xvfb — not your RDP screen)\n<code>{self.bm.page.url}</code>",
                         )
                     except PlaywrightError as exc:
                         reply(f"Screenshot failed: {exc}")
