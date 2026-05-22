@@ -34,6 +34,9 @@ env:
   USE_PROXY:               "false"
   DISPLAY:                 ":99"
   WEB_PORT:                "8080"
+  VIEWPORT_W:              "720"
+  VIEWPORT_H:              "1280"
+  PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: /usr/bin/chromium-browser
 
 jobs:
   hunt:
@@ -78,10 +81,18 @@ jobs:
             xdotool
           sudo fc-cache -fv
 
+      - name: Install Chromium with H.264/AAC codecs
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            chromium-browser \
+            chromium-codecs-ffmpeg-extra
+          # Verify codec build has H.264
+          chromium-browser --version
+
       - name: Start virtual desktop (noVNC)
         run: |
           # Virtual display
-          Xvfb "$DISPLAY" -screen 0 1920x1080x24 -ac &
+          Xvfb "$DISPLAY" -screen 0 1440x2560x24 -ac &
           sleep 2
 
           # Window manager
