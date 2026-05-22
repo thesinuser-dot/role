@@ -16,8 +16,8 @@ class Config:
     INSTAGRAM_REELS_URL: str = "https://www.instagram.com/reels/"
 
     # ── Viral thresholds ───────────────────────────────────────────────────────
-    MIN_VIEWS: int = int(os.environ.get("MIN_VIEWS", "50000"))
-    MIN_LIKES: int = int(os.environ.get("MIN_LIKES", "0"))
+    MIN_VIEWS: int = int(os.environ.get("MIN_VIEWS", "0"))
+    MIN_LIKES: int = int(os.environ.get("MIN_LIKES", "150000"))
 
     # ── Gemini vision ──────────────────────────────────────────────────────────
     GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
