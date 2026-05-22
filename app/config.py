@@ -52,6 +52,13 @@ class Config:
     SCREENSHOT_DIR: Path = Path(os.environ.get("SCREENSHOT_DIR", "/tmp/reels_screenshots"))
     COOKIES_FILE: Path = Path("/tmp/ig_cookies.txt")
 
+    # ── Proxy pool (Webshare.io) ───────────────────────────────────────────────
+    WEBSHARE_API_KEY: str = os.environ.get("WEBSHARE_API_KEY", "sbbfvqw45jm6f4d3pdbgirq4ids75i9ss137246x")
+    # "direct" = datacenter rotating proxies; "backbone" for residential
+    WEBSHARE_PROXY_MODE: str = os.environ.get("WEBSHARE_PROXY_MODE", "direct")
+    # Set to "false" to disable proxies entirely (useful for local testing)
+    USE_PROXY: bool = os.environ.get("USE_PROXY", "true").strip().lower() == "true"
+
     # ── Browser ────────────────────────────────────────────────────────────────
     HEADLESS: bool = os.environ.get("PLAYWRIGHT_HEADLESS", "false").strip().lower() == "true"
     VIEWPORT_W: int = 430
@@ -87,6 +94,9 @@ class Config:
             f"|  Gemini enabled     : {bool(cls.GEMINI_API_KEY)}",
             f"|  Telegram enabled   : {bool(cls.TELEGRAM_BOT_TOKEN and cls.TELEGRAM_CHAT_ID)}",
             f"|  Cookies set        : {bool(cls.INSTAGRAM_SESSION_COOKIES)}",
+            f"|  Proxy enabled      : {cls.USE_PROXY}",
+            f"|  Proxy mode         : {cls.WEBSHARE_PROXY_MODE}",
+            f"|  Webshare key set   : {bool(cls.WEBSHARE_API_KEY)}",
             "+------------------------------------------------------------",
         ]
         return "\n".join(lines)
