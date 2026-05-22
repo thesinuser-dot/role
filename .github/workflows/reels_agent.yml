@@ -70,7 +70,8 @@ jobs:
             libxrandr2 libgbm1 libxkbcommon0 libpango-1.0-0 \
             libpangocairo-1.0-0 libcairo2 "$ASOUND_PKG" libgtk-3-0 \
             libglib2.0-0 libx11-6 libx11-xcb1 libxcb1 libxss1 libxtst6 \
-            procps curl wget ca-certificates lsb-release
+            procps curl wget ca-certificates lsb-release \
+            xdotool
           sudo fc-cache -fv
 
       - name: Configure XRDP + XFCE4
