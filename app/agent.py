@@ -2,30 +2,14 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # agent.py — Orchestrator
 #
-# This file is the entry point only.  All domain logic lives in dedicated modules:
-#
-#   config.py      — Config dataclass (env-var backed)
-#   database.py    — DatabaseManager (SQLite, dedup, pending_uploads)
-#   browser.py     — BrowserManager (Playwright lifecycle + stealth + human sim)
-#   collector.py   — ReelCollector (feed navigation + metrics + URL collection)
-#   vision.py      — VisionEvaluator (Pillow Stage-1 + Gemini Stage-2)
-#   notifier.py    — NotificationService (Telegram delivery)
-#   downloader.py  — download_reel() (yt-dlp → interception → src fallback chain)
-#   pipeline.py    — WorkQueue / ReelTask / ReelStatus / FailureKind
-#
-# InstagramAgent is a thin coordinator:
-#   setup()        — open DB, browser, retry pending uploads from prior crashes
-#   run()          — initial hunt → command event loop
-#   _process_task  — per-reel state machine driven by ReelTask
-#   shutdown()     — flush DB, close browser, send run summary
-#
-# Exception handling policy (zero silent swallows):
-#   PlaywrightTimeout  → TRANSIENT (retryable)
-#   PlaywrightError    → depends on message; TRANSIENT or PERMANENT
-#   requests.*Error    → TRANSIENT
-#   subprocess errors  → logged at ERROR; specific reason stored on ReelTask
-#   bare Exception     → caught ONLY at the top of _process_task and run(),
-#                        always logged with full traceback + sent to Telegram
+# Changes (2026-05):
+#   • RunStats — fresh stats dataclass replacing ad-hoc scanned/sent counters
+#   • Command priority — _drain_cmd_queue() called inside the hunt loop so
+#     /help /status /stats /skip /set* are handled immediately, not blocked
+#     until the hunt finishes
+#   • USERS_ATTACK — hunt targets specific accounts when the list is populated
+#   • Caption filtering — pre-checks reel caption/hashtags against blacklist /
+#     whitelist before spending a screenshot + Gemini call on it
 # ─────────────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
@@ -38,6 +22,7 @@ import sys
 import threading
 import time
 import traceback
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -65,7 +50,7 @@ from pipeline import WorkQueue, ReelTask, ReelStatus, FailureKind
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_logger() -> logging.Logger:
-    fmt = "%(asctime)s [%(levelname)-8s] %(name)-22s | %(message)s"
+    fmt = "%(asctime)s ***%(levelname)-7s*** %(name)-22s | %(message)s"
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     if not root.handlers:
@@ -81,8 +66,103 @@ log = _build_logger()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Telegram command poller
-# Runs in a daemon thread; pushes parsed commands onto a shared Queue.
+# RunStats — single source of truth for all statistics
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class RunStats:
+    """
+    Tracks statistics for ONE hunt run.
+    All counters are updated in-place by _process_task; nothing is scattered
+    across the agent as bare int fields anymore.
+    """
+    scanned:         int = 0   # total reels pulled from queue
+    sent:            int = 0   # successfully sent to Telegram
+    skipped_thresh:  int = 0   # below view/like threshold
+    skipped_caption: int = 0   # rejected by caption blacklist
+    skipped_vision:  int = 0   # rejected by Gemini / pixel check
+    dedup:           int = 0   # already in DB
+    download_fail:   int = 0   # yt-dlp / interception failed
+    send_fail:       int = 0   # Telegram delivery failed
+    errors:          int = 0   # unexpected exceptions
+
+    def record(self, task: ReelTask) -> None:
+        """Update counters from a finished task."""
+        self.scanned += 1
+        if task.status == ReelStatus.DOWNLOADED:
+            self.sent += 1
+        elif task.status == ReelStatus.FAILED:
+            kind = task.failure_kind
+            if kind == FailureKind.DOWNLOAD:
+                self.download_fail += 1
+            elif kind == FailureKind.SEND:
+                self.send_fail += 1
+            else:
+                self.errors += 1
+        elif task.status == ReelStatus.SKIPPED:
+            reason = (task.failure_reason or "").lower()
+            if "vision" in reason or "gemini" in reason or "stage" in reason:
+                self.skipped_vision += 1
+            elif "caption" in reason or "blacklist" in reason or "whitelist" in reason:
+                self.skipped_caption += 1
+            else:
+                self.skipped_thresh += 1
+
+    def telegram_summary(self, elapsed: float, db_stats: Dict[str, int]) -> str:
+        m, s = divmod(int(elapsed), 60)
+        lines = [
+            "📊 <b>Hunt Summary</b>",
+            f"⏱ Duration  : {m}m {s}s",
+            "",
+            "── This run ──────────────────",
+            f"🔍 Scanned        : {self.scanned}",
+            f"✅ Sent           : {self.sent}",
+            f"⏭ Below threshold: {self.skipped_thresh}",
+            f"📝 Caption filter : {self.skipped_caption}",
+            f"👁 Vision rejected: {self.skipped_vision}",
+            f"⬇ DL failures    : {self.download_fail}",
+            f"📤 Send failures  : {self.send_fail}",
+            f"💥 Errors         : {self.errors}",
+            "",
+            "── All-time DB ───────────────",
+            f"📦 Total processed: {db_stats.get('total', 0):,}",
+            f"✅ Downloaded     : {db_stats.get('downloaded', 0):,}",
+            f"⏭ Skipped        : {db_stats.get('skipped', 0):,}",
+            f"💥 Errors         : {db_stats.get('errors', 0):,}",
+        ]
+        return "\n".join(lines)
+
+    def telegram_stats_cmd(self, db_stats: Dict[str, int]) -> str:
+        """Used by /stats command — full breakdown."""
+        lines = [
+            "📊 <b>All-time Statistics</b>\n",
+            f"Total processed : {db_stats.get('total', 0):,}",
+            f"Downloaded      : {db_stats.get('downloaded', 0):,}",
+            f"Skipped         : {db_stats.get('skipped', 0):,}",
+            f"Errors          : {db_stats.get('errors', 0):,}",
+            "",
+            "<b>This session</b>",
+            f"Scanned         : {self.scanned}",
+            f"Sent            : {self.sent}",
+            f"Below threshold : {self.skipped_thresh}",
+            f"Caption filter  : {self.skipped_caption}",
+            f"Vision rejected : {self.skipped_vision}",
+            f"DL failures     : {self.download_fail}",
+            f"Send failures   : {self.send_fail}",
+        ]
+        return "\n".join(lines)
+
+    def log_summary(self) -> str:
+        return (
+            f"scanned={self.scanned} sent={self.sent} "
+            f"thresh_skip={self.skipped_thresh} caption_skip={self.skipped_caption} "
+            f"vision_skip={self.skipped_vision} dl_fail={self.download_fail} "
+            f"send_fail={self.send_fail} errors={self.errors}"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Telegram command poller (daemon thread)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TelegramCommandPoller:
@@ -188,11 +268,6 @@ class TelegramCommandPoller:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _capture_reel_screenshot(page: Page, reel_id: str) -> Optional[bytes]:
-    """
-    Take a screenshot of the video element (preferred) or the viewport.
-    Returns bytes on success.
-    Raises PlaywrightError / PlaywrightTimeout on failure — callers handle these.
-    """
     el = None
     for sel in SelectorRegistry.VIDEO_ELEMENT:
         try:
@@ -232,25 +307,25 @@ class InstagramAgent:
         self.log        = logging.getLogger("InstagramAgent")
         self.start_time = time.monotonic()
 
-        # ── Core services ─────────────────────────────────────────────────────
         self.db       = DatabaseManager(Config.DB_PATH)
         self.bm       = BrowserManager()
         self.vision   = VisionEvaluator(Config.GEMINI_API_KEY)
         self.notifier = NotificationService(Config.TELEGRAM_BOT_TOKEN, Config.TELEGRAM_CHAT_ID)
         self.wq       = WorkQueue()
 
-        # collector is built after browser.launch() gives us a live page
         self.collector: Optional[ReelCollector] = None
 
-        # ── State ─────────────────────────────────────────────────────────────
         self._run_id: Optional[int] = None
-        self.scanned  = 0
-        self.sent     = 0
+
+        # ── Stats (rebuilt from scratch each session) ──────────────────────
+        # session_stats accumulates across ALL hunt runs in one agent process.
+        # Each hunt also creates its own local RunStats for per-run summaries.
+        self.session_stats = RunStats()
+
         self._stop    = False
         self._hunting = False
-        self._skip_collection = False   # set True by /skip to stop URL collection early
+        self._skip_collection = False
 
-        # ── Telegram command machinery ─────────────────────────────────────────
         self._cmd_queue: queue.Queue = queue.Queue()
         self._poller = TelegramCommandPoller(
             Config.TELEGRAM_BOT_TOKEN,
@@ -258,7 +333,6 @@ class InstagramAgent:
             self._cmd_queue,
         )
 
-        # ── Paths & signals ───────────────────────────────────────────────────
         Config.DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
         Config.SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
         signal.signal(signal.SIGTERM, self._on_signal)
@@ -281,17 +355,38 @@ class InstagramAgent:
             return True
         return False
 
+    # ── Caption / hashtag pre-filter ──────────────────────────────────────────
+
+    @staticmethod
+    def _caption_passes(caption: str) -> tuple[bool, str]:
+        """
+        Check caption/hashtags against the blacklist and whitelist.
+        Returns (passes: bool, reason: str).
+        Blacklist wins over whitelist.
+        """
+        if not caption:
+            return True, "no caption"
+
+        lower = caption.lower()
+
+        for word in Config.CAPTION_BLACKLIST:
+            if word.lower() in lower:
+                return False, f"caption blacklist: '{word}'"
+
+        # Whitelist is advisory (not required) — if populated, reel must match at
+        # least one whitelist term.  If whitelist is empty we skip this check.
+        if Config.CAPTION_WHITELIST:
+            for word in Config.CAPTION_WHITELIST:
+                if word.lower() in lower:
+                    return True, f"caption whitelist match: '{word}'"
+            # No whitelist hit — neutral (don't reject, let vision decide)
+            return True, "caption neutral (no whitelist match)"
+
+        return True, "caption ok"
+
     # ── Pending-upload retry ──────────────────────────────────────────────────
 
     def _retry_pending_uploads(self) -> int:
-        """
-        On startup, re-send any videos that were downloaded but whose Telegram
-        delivery was not confirmed in the previous run (crash, timeout, etc.).
-
-        A row is removed from pending_uploads ONLY after a confirmed send.
-        Videos whose local file no longer exists are purged immediately.
-        Returns the count of successfully delivered videos.
-        """
         pending = self.db.get_pending_uploads(Config.MAX_UPLOAD_ATTEMPTS)
         if not pending:
             return 0
@@ -343,21 +438,10 @@ class InstagramAgent:
     # ── Setup ─────────────────────────────────────────────────────────────────
 
     def _switch_to_rdp_display_if_available(self) -> bool:
-        """
-        Detect a live XRDP X display (:10+) and point DISPLAY at it.
-
-        The workflow's Run step already waits up to 60s for the display and
-        exports DISPLAY before launching python3.  So by the time we reach
-        here DISPLAY is almost certainly already correct — we just verify it
-        and log what we found.  If for some reason it's still pointing at
-        Xvfb (:99) we do a quick re-check of the socket directory.
-        """
         import subprocess as _sp
         import glob as _glob
 
         current = os.environ.get("DISPLAY", "")
-
-        # If DISPLAY is already an RDP display (:10+), nothing to do
         try:
             num = int(current.lstrip(":"))
             if num >= 10:
@@ -366,7 +450,6 @@ class InstagramAgent:
         except (ValueError, AttributeError):
             pass
 
-        # DISPLAY is :99 (Xvfb) or unset — do one quick socket scan
         try:
             sockets = _glob.glob("/tmp/.X11-unix/X*")
             rdp_sockets = sorted(
@@ -400,16 +483,11 @@ class InstagramAgent:
         try:
             self.bm.write_netscape_cookies(Config.INSTAGRAM_SESSION_COOKIES)
         except Exception:
-            # Non-fatal — yt-dlp will run unauthenticated
             self.log.warning(
                 f"Failed to write Netscape cookies file "
                 f"(yt-dlp will run without auth):\n{traceback.format_exc()}"
             )
 
-        # ── Auto-detect RDP display before launching browser ──────────────────
-        # If an XRDP session is already live (display :10+), use it so the
-        # browser appears on screen immediately without needing /startdisplay.
-        # Falls back to DISPLAY env var (Xvfb :99) if no RDP session yet.
         self._switch_to_rdp_display_if_available()
 
         try:
@@ -420,13 +498,11 @@ class InstagramAgent:
             self.notifier.send_crash_alert(f"Browser launch failure:\n{tb}")
             return False
 
-        # Collector requires a live page — build after launch()
         self.collector = ReelCollector(self.bm)
 
         try:
             self._retry_pending_uploads()
         except Exception:
-            # Pending retry failure must not abort the run
             self.log.warning(
                 f"Pending upload retry raised an exception (non-fatal):\n"
                 f"{traceback.format_exc()}"
@@ -441,10 +517,16 @@ class InstagramAgent:
 
     # ── Per-reel state machine ────────────────────────────────────────────────
 
-    def _process_task(self, task: ReelTask, force: bool = False, skip_vision: bool = False) -> None:
+    def _process_task(
+        self,
+        task: ReelTask,
+        run_stats: RunStats,
+        force: bool = False,
+        skip_vision: bool = False,
+    ) -> None:
         """
-        Drive one ReelTask through the full pipeline.  Updates task.status in-place.
-        Every failure path logs a structured reason and writes to the DB.
+        Drive one ReelTask through the full pipeline.
+        Updates task.status in-place and records outcome into run_stats.
         No exception is silently swallowed.
         """
         reel_id  = task.reel_id
@@ -463,14 +545,15 @@ class InstagramAgent:
             task.mark_retry(f"Navigation timeout: {exc}", FailureKind.TRANSIENT)
             self.log.warning(f"[{reel_id}] Navigation timeout (retryable): {exc}")
             self.db.mark_processed(reel_id, reel_url, "error", 0, 0, str(exc)[:200])
+            run_stats.record(task)
             return
         except PlaywrightError as exc:
             task.mark_retry(f"Navigation Playwright error: {exc}", FailureKind.TRANSIENT)
             self.log.error(f"[{reel_id}] Navigation Playwright error: {exc}")
             self.db.mark_processed(reel_id, reel_url, "error", 0, 0, str(exc)[:200])
+            run_stats.record(task)
             return
 
-        # Wait for video + network idle so lazy stats have time to load
         try:
             page.wait_for_selector("video", timeout=10_000)
         except PlaywrightTimeout:
@@ -478,8 +561,6 @@ class InstagramAgent:
         except PlaywrightError as exc:
             self.log.warning(f"[{reel_id}] wait_for_selector error (non-fatal): {exc}")
 
-        # NOTE: extract_metrics() calls wait_for_load_state("networkidle") itself.
-        # A second call here would add 8s+ of wasted wait per reel. Removed.
         self.bm.delay(1000, 1500)
 
         # ── 2. Metrics ────────────────────────────────────────────────────────
@@ -489,11 +570,13 @@ class InstagramAgent:
             task.mark_retry(f"Metrics Playwright error: {exc}", FailureKind.TRANSIENT)
             self.log.error(f"[{reel_id}] Metrics extraction Playwright error: {exc}")
             self.db.mark_processed(reel_id, reel_url, "error", 0, 0, str(exc)[:200])
+            run_stats.record(task)
             return
         except Exception as exc:
             task.mark_failed(f"Metrics unexpected error: {exc}", FailureKind.UNKNOWN)
             self.log.error(f"[{reel_id}] Metrics unexpected error:\n{traceback.format_exc()}")
             self.db.mark_processed(reel_id, reel_url, "error", 0, 0, str(exc)[:200])
+            run_stats.record(task)
             return
 
         views = metrics["views"]
@@ -508,17 +591,32 @@ class InstagramAgent:
                 task.mark_skipped(reason, FailureKind.PERMANENT)
                 self.log.info(f"[{reel_id}] SKIP: {reason}")
                 self.db.mark_processed(reel_id, reel_url, "skipped", views, likes, reason)
+                run_stats.record(task)
                 return
             if Config.MIN_VIEWS > 0 and views < Config.MIN_VIEWS:
                 reason = f"Views {views:,} < threshold {Config.MIN_VIEWS:,}"
                 task.mark_skipped(reason, FailureKind.PERMANENT)
                 self.log.info(f"[{reel_id}] SKIP: {reason}")
                 self.db.mark_processed(reel_id, reel_url, "skipped", views, likes, reason)
+                run_stats.record(task)
                 return
 
         self.log.info(f"[{reel_id}] Metrics passed — views={views:,}  likes={likes:,}")
 
-        # ── 4. Vision ─────────────────────────────────────────────────────────
+        # ── 4. Caption filter (before expensive vision call) ──────────────────
+        if not force:
+            caption = metrics.get("caption", "")
+            ok, cap_reason = self._caption_passes(caption)
+            if not ok:
+                reason = f"Caption filter: {cap_reason}"
+                task.mark_skipped(reason, FailureKind.PERMANENT)
+                self.log.info(f"[{reel_id}] SKIP ({reason})")
+                self.db.mark_processed(reel_id, reel_url, "skipped", views, likes, reason)
+                run_stats.record(task)
+                return
+            self.log.info(f"[{reel_id}] Caption OK: {cap_reason}")
+
+        # ── 5. Vision ─────────────────────────────────────────────────────────
         if not skip_vision:
             screenshot: Optional[bytes] = None
             try:
@@ -531,6 +629,7 @@ class InstagramAgent:
             if not screenshot:
                 task.mark_failed("Screenshot capture failed", FailureKind.VISION)
                 self.db.mark_processed(reel_id, reel_url, "error", views, likes, "screenshot_failed")
+                run_stats.record(task)
                 return
 
             try:
@@ -542,19 +641,21 @@ class InstagramAgent:
                 )
                 task.mark_failed(f"Vision exception: {exc}", FailureKind.VISION)
                 self.db.mark_processed(reel_id, reel_url, "skipped", views, likes, f"vision_exception:{exc}")
+                run_stats.record(task)
                 return
 
             if not vision_ok:
                 task.mark_skipped(vision_reason, FailureKind.VISION)
                 self.log.info(f"[{reel_id}] SKIP (vision): {vision_reason}")
                 self.db.mark_processed(reel_id, reel_url, "skipped", views, likes, f"vision:{vision_reason}")
+                run_stats.record(task)
                 return
 
             self.log.info(f"[{reel_id}] Vision passed: {vision_reason}")
         else:
             self.log.info(f"[{reel_id}] Vision SKIPPED (test mode)")
 
-        # ── 5. Download (three-strategy chain) ───────────────────────────────
+        # ── 6. Download ───────────────────────────────────────────────────────
         self.log.info(f"[{reel_id}] All gates cleared — downloading...")
         video_path, strategy = download_reel(reel_url, reel_id, page=page)
 
@@ -562,13 +663,12 @@ class InstagramAgent:
             task.mark_retry("All download strategies failed", FailureKind.DOWNLOAD)
             self.log.error(f"[{reel_id}] Download failed (all strategies exhausted)")
             self.db.mark_processed(reel_id, reel_url, "download_failed", views, likes, "all_strategies_failed")
+            run_stats.record(task)
             return
 
         self.log.info(f"[{reel_id}] Downloaded via strategy={strategy}")
 
-        # ── 6. Register pending BEFORE Telegram upload (crash-safety) ────────
-        # If the process dies during upload, the next startup will retry from
-        # pending_uploads.  The row is deleted only after confirmed delivery.
+        # ── 7. Register pending BEFORE Telegram upload (crash-safety) ─────────
         try:
             self.db.add_pending_upload(reel_id, reel_url, video_path, views, likes)
         except Exception as exc:
@@ -577,7 +677,7 @@ class InstagramAgent:
                 f"(send will still be attempted): {exc}"
             )
 
-        # ── 7. Telegram send ──────────────────────────────────────────────────
+        # ── 8. Telegram send ──────────────────────────────────────────────────
         self.log.info(f"[{reel_id}] Sending to Telegram...")
         try:
             sent = self.notifier.send_qualified_reel(video_path, reel_url, views, likes)
@@ -586,9 +686,9 @@ class InstagramAgent:
                 f"[{reel_id}] Telegram send raised exception: "
                 f"{exc}\n{traceback.format_exc()}"
             )
-            # Keep pending_upload row — will be retried on next startup
             task.mark_retry(f"Telegram send exception: {exc}", FailureKind.SEND)
             self.db.mark_processed(reel_id, reel_url, "telegram_failed", views, likes, str(exc)[:200])
+            run_stats.record(task)
             return
 
         if sent:
@@ -600,10 +700,48 @@ class InstagramAgent:
             self.log.info(f"[{reel_id}] Delivered to Telegram (strategy={strategy})")
             self.db.mark_processed(reel_id, reel_url, "downloaded", views, likes)
         else:
-            # send_qualified_reel returned False — file kept for retry
             task.mark_retry("Telegram delivery returned False", FailureKind.SEND)
             self.log.error(f"[{reel_id}] Telegram delivery failed — keeping local file for next run")
             self.db.mark_processed(reel_id, reel_url, "telegram_failed", views, likes, "delivery_failed")
+
+        run_stats.record(task)
+
+    # ── Command priority: drain queue without blocking ────────────────────────
+
+    def _drain_cmd_queue(self, defer_hunt_cmds: bool = True) -> None:
+        """
+        Process ALL commands currently waiting in the queue RIGHT NOW.
+
+        Called:
+          • At the top of each reel iteration inside _run_hunt() so that
+            /help /status /stats /skip /set* are handled immediately —
+            not delayed until the hunt finishes.
+          • From the main event loop as usual.
+
+        When defer_hunt_cmds=True (inside a running hunt), __hunt__ and
+        __test__ are put back on the queue rather than executed inline, so
+        they run after the current hunt completes.
+        """
+        deferred: List[Dict] = []
+        while True:
+            try:
+                item = self._cmd_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            cmd = item["cmd"]
+            if defer_hunt_cmds and cmd in ("__hunt__", "__test__"):
+                deferred.append(item)
+                continue
+
+            try:
+                self._dispatch_command(cmd, item["arg"])
+            except Exception as exc:
+                self.log.error(f"Command dispatch error for {cmd!r}: {exc}")
+
+        # Put deferred items back (FIFO order maintained)
+        for item in deferred:
+            self._cmd_queue.put(item)
 
     # ── Hunt cycle ────────────────────────────────────────────────────────────
 
@@ -614,8 +752,7 @@ class InstagramAgent:
             return
 
         self._hunting = True
-        run_scanned = 0
-        run_sent    = 0
+        run_stats = RunStats()          # fresh stats for this run
         run_id: Optional[int] = None
 
         try:
@@ -634,7 +771,7 @@ class InstagramAgent:
                 self.notifier,
                 stop_fn=lambda: self._skip_collection,
             )
-            self._skip_collection = False  # reset for any future hunt
+            self._skip_collection = False
             if not reel_urls:
                 self.log.warning("No Reel URLs collected.")
                 self.notifier.send_message("⚠️ No Reels found in this run.")
@@ -642,15 +779,16 @@ class InstagramAgent:
 
             self.log.info(f"Processing {len(reel_urls)} URL(s)...")
 
-            # Enqueue all into scan queue
             for url in reel_urls:
                 self.wq.enqueue_url(url)
 
-            # Dedup pass → process each task
             while not self.wq.scan.empty():
+                # ── Priority: flush commands BEFORE each reel ──────────────
+                self._drain_cmd_queue(defer_hunt_cmds=True)
+
                 if self._stop or self._deadline_approaching():
                     break
-                if run_sent >= Config.MAX_QUALIFIED_SEND:
+                if run_stats.sent >= Config.MAX_QUALIFIED_SEND:
                     break
 
                 try:
@@ -665,6 +803,7 @@ class InstagramAgent:
 
                 if self.db.is_processed(reel_id):
                     self.log.info(f"[{reel_id}] DEDUP hit — skipping.")
+                    run_stats.dedup += 1
                     continue
 
                 task = ReelTask(
@@ -673,54 +812,52 @@ class InstagramAgent:
                     max_attempts=Config.MAX_DOWNLOAD_ATTEMPTS,
                 )
                 self.wq.enqueue_task(task)
-                self._process_task(task)
+                self._process_task(task, run_stats)
 
-                if task.status == ReelStatus.DOWNLOADED:
-                    run_sent     += 1
-                    self.sent    += 1
-                    run_scanned  += 1
-                    self.scanned += 1
-                elif task.status in (ReelStatus.SKIPPED, ReelStatus.FAILED):
-                    run_scanned  += 1
-                    self.scanned += 1
-                elif task.status == ReelStatus.RETRY:
+                if task.status == ReelStatus.RETRY:
                     self.wq.enqueue_retry(task)
-                    run_scanned  += 1
-                    self.scanned += 1
 
                 if task.status not in (ReelStatus.SKIPPED,):
                     self.bm.delay(800, 2500)
 
-            # Flush retries — one pass, prevents infinite loops in a single run
+            # Flush retries — one pass
             retried = self.wq.flush_retries()
             if retried:
                 self.log.info(f"Processing {retried} retry task(s)...")
                 while not self.wq.process.empty():
+                    self._drain_cmd_queue(defer_hunt_cmds=True)
                     if self._stop or self._deadline_approaching():
                         break
-                    if run_sent >= Config.MAX_QUALIFIED_SEND:
+                    if run_stats.sent >= Config.MAX_QUALIFIED_SEND:
                         break
                     try:
                         task = self.wq.process.get_nowait()
                     except Exception:
                         break
-                    self._process_task(task)
-                    if task.status == ReelStatus.DOWNLOADED:
-                        run_sent     += 1
-                        self.sent    += 1
-                        run_scanned  += 1
-                        self.scanned += 1
+                    self._process_task(task, run_stats)
 
         finally:
             self._hunting = False
-            self.log.info(f"Hunt finished: scanned={run_scanned}  sent={run_sent}")
+            self.log.info(f"Hunt finished: {run_stats.log_summary()}")
             self.log.info(f"Queue stats: {self.wq.stats()}")
+
+            # Merge run stats into session totals
+            self.session_stats.scanned         += run_stats.scanned
+            self.session_stats.sent            += run_stats.sent
+            self.session_stats.skipped_thresh  += run_stats.skipped_thresh
+            self.session_stats.skipped_caption += run_stats.skipped_caption
+            self.session_stats.skipped_vision  += run_stats.skipped_vision
+            self.session_stats.download_fail   += run_stats.download_fail
+            self.session_stats.send_fail       += run_stats.send_fail
+            self.session_stats.errors          += run_stats.errors
+            self.session_stats.dedup           += run_stats.dedup
+
             try:
-                stats   = self.db.get_aggregate_stats()
-                elapsed = self._elapsed()
-                self.notifier.send_run_summary(elapsed, run_scanned, run_sent, stats)
+                db_stats = self.db.get_aggregate_stats()
+                summary  = run_stats.telegram_summary(self._elapsed(), db_stats)
+                self.notifier.send_message(summary)
                 if run_id:
-                    self.db.end_run(run_id, run_scanned, run_sent, "completed")
+                    self.db.end_run(run_id, run_stats.scanned, run_stats.sent, "completed")
             except Exception as exc:
                 self.log.warning(f"Could not finalise hunt record: {exc}")
 
@@ -738,8 +875,9 @@ class InstagramAgent:
             return
 
         task = ReelTask(url=url, reel_id=reel_id, max_attempts=1)
+        dummy_stats = RunStats()
         try:
-            self._process_task(task, force=True, skip_vision=True)
+            self._process_task(task, dummy_stats, force=True, skip_vision=True)
             self._poller.reply(f"✅ Test complete — status: <b>{task.status.value}</b>")
         except KeyboardInterrupt:
             raise
@@ -752,16 +890,23 @@ class InstagramAgent:
 
     def _get_status_text(self) -> str:
         m, s = divmod(int(self._elapsed()), 60)
+        s_st = self.session_stats
         return (
             "<b>🔍 Reels Hunter — Status</b>\n\n"
             f"<b>Uptime:</b> {m}m {s}s\n"
-            f"<b>Hunting:</b> {'🟢 Yes' if self._hunting else '🔴 Idle'}\n"
-            f"<b>Scanned:</b> {self.scanned}\n"
-            f"<b>Sent:</b> {self.sent}\n\n"
+            f"<b>Hunting:</b> {'🟢 Yes' if self._hunting else '🔴 Idle'}\n\n"
+            f"<b>Session stats</b>\n"
+            f"  Scanned         : {s_st.scanned}\n"
+            f"  Sent            : {s_st.sent}\n"
+            f"  Below threshold : {s_st.skipped_thresh}\n"
+            f"  Caption filter  : {s_st.skipped_caption}\n"
+            f"  Vision rejected : {s_st.skipped_vision}\n"
+            f"  Dedup skipped   : {s_st.dedup}\n"
+            f"  DL failures     : {s_st.download_fail}\n\n"
             f"<b>Min Views:</b> {Config.MIN_VIEWS:,}\n"
             f"<b>Scan Target:</b> {Config.TARGET_REELS_SCAN}\n"
             f"<b>Max Send:</b> {Config.MAX_QUALIFIED_SEND}\n"
-            f"<b>Headless:</b> {Config.HEADLESS}\n"
+            f"<b>Target accounts:</b> {', '.join(Config.USERS_ATTACK) or '(feed)'}\n"
             f"\n<b>Queue:</b> <code>{self.wq.stats()}</code>"
         )
 
@@ -777,14 +922,8 @@ class InstagramAgent:
 
         elif cmd == "/stats":
             try:
-                stats = self.db.get_aggregate_stats()
-                reply(
-                    "<b>📊 All-time Stats</b>\n\n"
-                    f"Total processed : {stats.get('total', 0):,}\n"
-                    f"Downloaded      : {stats.get('downloaded', 0):,}\n"
-                    f"Skipped         : {stats.get('skipped', 0):,}\n"
-                    f"Errors          : {stats.get('errors', 0):,}\n"
-                )
+                db_stats = self.db.get_aggregate_stats()
+                reply(self.session_stats.telegram_stats_cmd(db_stats))
             except Exception as exc:
                 reply(f"❌ Stats error: {exc}")
 
@@ -843,7 +982,6 @@ class InstagramAgent:
             reply("🖥️ Detecting RDP display and relaunching browser on it...")
             try:
                 import subprocess as _sp
-                # Find the XRDP display (always :10 or higher)
                 sockets = _sp.run(
                     ["ls", "/tmp/.X11-unix/"],
                     capture_output=True, text=True, timeout=5,
@@ -853,10 +991,6 @@ class InstagramAgent:
                     entry = entry.strip()
                     if entry.startswith("X"):
                         num_str = entry[1:]
-                        # FIX Bug 2: XRDP sessions are :10–:50.
-                        # Xvfb fallback runs on :99 which also passes ">= 10",
-                        # making /startdisplay falsely think Xvfb is an RDP
-                        # session and relaunching on the same invisible display.
                         if num_str.isdigit() and 10 <= int(num_str) <= 50:
                             rdp_display = f":{num_str}"
                             break
@@ -864,15 +998,12 @@ class InstagramAgent:
                 if rdp_display:
                     self.log.info(f"/startdisplay: found RDP display {rdp_display}")
                     reply(f"🖥️ Found RDP display <code>{rdp_display}</code> — relaunching browser on it…")
-                    # Close existing browser on the old display
                     try:
                         self.bm.close()
                     except Exception as close_exc:
                         self.log.warning(f"Browser close before relaunch: {close_exc}")
-                    # Switch display and relaunch
                     os.environ["DISPLAY"] = rdp_display
                     self.bm.launch()
-                    # Navigate back to current reel or feed
                     try:
                         self.bm.page.goto(
                             "https://www.instagram.com/reels/",
@@ -887,8 +1018,6 @@ class InstagramAgent:
                     except PlaywrightError as exc:
                         self.log.debug(f"Post-relaunch screenshot failed: {exc}")
                 else:
-                    # No XRDP display in range :10–:50 found.
-                    # Don't relaunch on Xvfb — that's invisible and misleads the user.
                     current_disp = os.environ.get('DISPLAY', '?')
                     reply(
                         f"⚠️ No RDP session found (checked :10–:50 range).\n\n"
@@ -896,8 +1025,6 @@ class InstagramAgent:
                         f"({'Xvfb — invisible' if current_disp in (':99', ':0') else 'unknown'}).\n\n"
                         "Connect via RDP first, then send /startdisplay again."
                     )
-                    # Still send a screenshot so the user can at least see what
-                    # Playwright is seeing, even if it's on Xvfb.
                     try:
                         snap = self.bm.page.screenshot(type="jpeg", quality=75)
                         self.notifier.send_photo(
@@ -923,6 +1050,14 @@ class InstagramAgent:
                     "reels collected so far."
                 )
 
+        elif cmd == "/resume":
+            # /resume re-enables hunting if it was paused / stopped
+            if self._hunting:
+                reply("🟢 Hunt is already running.")
+            else:
+                reply("▶️ Resuming — starting a new hunt run...")
+                self._cmd_queue.put({"cmd": "__hunt__", "arg": ""})
+
         else:
             reply(f"❓ Unknown command: <code>{cmd}</code>  Try /help")
 
@@ -943,10 +1078,8 @@ class InstagramAgent:
         final_status = "completed"
 
         try:
-            # Initial automatic hunt
             self._run_hunt()
 
-            # Command event loop — keep alive for bot commands
             self.log.info("Entering command loop — waiting for Telegram commands...")
             while not self._stop:
                 if self._deadline_approaching():
@@ -1002,16 +1135,16 @@ class InstagramAgent:
 
         finally:
             self._poller.stop()
-            self._send_run_summary()
+            self._send_session_summary()
             self.shutdown(final_status)
 
-    def _send_run_summary(self) -> None:
+    def _send_session_summary(self) -> None:
         try:
-            stats   = self.db.get_aggregate_stats()
-            elapsed = self._elapsed()
-            self.notifier.send_run_summary(elapsed, self.scanned, self.sent, stats)
+            db_stats = self.db.get_aggregate_stats()
+            summary  = self.session_stats.telegram_summary(self._elapsed(), db_stats)
+            self.notifier.send_message(f"🏁 <b>Session ended</b>\n\n{summary}")
         except Exception as exc:
-            self.log.warning(f"Could not send run summary: {exc}")
+            self.log.warning(f"Could not send session summary: {exc}")
 
     def shutdown(self, status: str = "completed") -> None:
         self.log.info(f"Shutdown initiated (status={status})...")
@@ -1031,14 +1164,19 @@ class InstagramAgent:
 
         try:
             if self._run_id and self.db.conn:
-                self.db.end_run(self._run_id, self.scanned, self.sent, status)
+                self.db.end_run(
+                    self._run_id,
+                    self.session_stats.scanned,
+                    self.session_stats.sent,
+                    status,
+                )
         except Exception as exc:
             self.log.warning(f"Could not finalise run record: {exc}")
 
         self.db.close()
         self.log.info(
             f"Shutdown complete in {self._elapsed():.1f}s | "
-            f"scanned={self.scanned}  sent={self.sent}"
+            f"session: {self.session_stats.log_summary()}"
         )
 
 
@@ -1053,3 +1191,5 @@ if __name__ == "__main__":
     log.info("=" * 70)
     agent = InstagramAgent()
     agent.run()
+PYEOF
+echo "agent.py written"
