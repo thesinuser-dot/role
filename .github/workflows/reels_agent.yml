@@ -31,6 +31,7 @@ env:
   DB_PATH:                 history.db
   DOWNLOAD_DIR:            /tmp/reels_downloads
   SCREENSHOT_DIR:          /tmp/reels_screenshots
+  USE_PROXY:               "false"
   DISPLAY:                 ":99"
   WEB_PORT:                "8080"
 
@@ -80,7 +81,7 @@ jobs:
       - name: Start virtual desktop (noVNC)
         run: |
           # Virtual display
-          Xvfb "$DISPLAY" -screen 0 1280x1024x24 -ac &
+          Xvfb "$DISPLAY" -screen 0 1920x1080x24 -ac &
           sleep 2
 
           # Window manager
