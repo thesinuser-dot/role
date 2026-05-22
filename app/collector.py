@@ -201,74 +201,164 @@ class ReelCollector:
     # ── Metrics extraction ────────────────────────────────────────────────────
 
     def extract_metrics(self) -> Dict[str, int]:
-        # Give Instagram's lazy-loaded engagement section time to render
-        self._bm.delay(1500, 2500)
+        """
+        Extract view + like counts from the current reel page.
 
-        views = self._extract_views_js()
-        if views == 0:
-            # JS traversal failed — fall back to CSS selector approach
-            self.log.debug("JS view extraction got 0 — trying CSS fallback")
-            views = self._extract_count(
-                SelectorRegistry.VIEW_COUNT,
-                keyword="view",
-                exclude=None,
-                label="views",
+        Instagram's engagement stats are lazy-loaded and often require:
+          - waiting for the network to settle (networkidle)
+          - scrolling the stats section into view so it renders
+          - multiple extraction attempts with increasing delays
+        """
+        # Step 1: wait for network to settle so lazy JS has run
+        try:
+            self._page.wait_for_load_state("networkidle", timeout=8_000)
+        except Exception:
+            pass  # non-fatal — proceed with whatever is loaded
+
+        # Step 2: scroll the like/view section into view to trigger lazy render
+        try:
+            self._page.evaluate("""
+                () => {
+                    // Scroll to the bottom-right action bar where stats live
+                    const candidates = [
+                        ...document.querySelectorAll('section, [role="main"]'),
+                    ];
+                    const last = candidates[candidates.length - 1];
+                    if (last) last.scrollIntoView({behavior: 'instant', block: 'center'});
+                }
+            """)
+        except Exception:
+            pass
+
+        self._bm.delay(2000, 3000)
+
+        # Step 3: try extraction — retry once with longer wait if we get 0
+        for attempt in range(2):
+            views = self._extract_views_js()
+            if views == 0:
+                self.log.debug(f"JS view extraction got 0 (attempt {attempt+1}) — trying CSS fallback")
+                views = self._extract_count(
+                    SelectorRegistry.VIEW_COUNT,
+                    keyword="view",
+                    exclude=None,
+                    label="views",
+                )
+
+            likes = self._extract_count(
+                SelectorRegistry.LIKE_COUNT,
+                keyword="like",
+                exclude="unlike",
+                label="likes",
             )
 
-        likes = self._extract_count(
-            SelectorRegistry.LIKE_COUNT,
-            keyword="like",
-            exclude="unlike",
-            label="likes",
-        )
+            if views > 0 or likes > 0:
+                break
+
+            if attempt == 0:
+                # Stats still 0 — wait longer and retry once
+                self.log.debug("Stats still 0 — waiting 4s and retrying extraction")
+                self._bm.delay(3500, 4500)
+                # Try scrolling the page a bit to trigger render
+                try:
+                    self._page.mouse.wheel(0, 300)
+                    self._bm.delay(500, 800)
+                    self._page.mouse.wheel(0, -300)
+                except Exception:
+                    pass
+
         self.log.info(f"Metrics: views={views:,}  likes={likes:,}")
         return {"views": views, "likes": likes}
 
     def _extract_views_js(self) -> int:
         """
-        Walk the DOM text nodes via JavaScript to find the view count.
+        Multi-strategy JS extraction for view count.
 
-        Instagram renders the number and the 'views' label in separate sibling
-        spans, so CSS-selector-based approaches that require both to be in the
-        same element always return 0.  Walking text nodes and looking for a
-        numeric value adjacent to a 'views' label is far more robust.
+        Instagram frequently changes its DOM structure.  We try 5 strategies
+        in order of reliability:
+          1. window.__additionalData / window._sharedData (API response cached in page)
+          2. <meta> / <script type="application/ld+json"> structured data
+          3. aria-label attributes containing "X views"
+          4. Text-node walk: single node "1.2M views"
+          5. Text-node walk: number node followed by "views" node nearby
         """
         try:
             raw = self._page.evaluate("""
                 () => {
-                    const walker = document.createTreeWalker(
-                        document.body, NodeFilter.SHOW_TEXT, null, false
-                    );
-                    const texts = [];
-                    let node;
-                    while ((node = walker.nextNode())) {
-                        const t = node.textContent.trim();
-                        if (t) texts.push(t);
-                    }
+                    // ── Strategy 1: Instagram's in-page data objects ──────────────────
+                    try {
+                        // Modern IG stores media data in __additionalData keyed by path
+                        if (window.__additionalData) {
+                            const vals = Object.values(window.__additionalData);
+                            for (const v of vals) {
+                                const media = v?.data?.xdt_api__v1__media__shortcode__web_info?.data?.items?.[0]
+                                    || v?.data?.shortcode_media;
+                                if (media) {
+                                    const vc = media.video_view_count ?? media.play_count
+                                        ?? media.view_count ?? null;
+                                    if (vc != null && vc > 0) return String(vc);
+                                }
+                            }
+                        }
+                    } catch(e) {}
 
-                    // Pattern 1: single text node like "1.2M views" or "12,345 views"
-                    for (const t of texts) {
-                        const m = /^([\d,]+\.?\d*\s*[KMBkmb]?)\s+views?$/i.exec(t);
-                        if (m) return m[1];
-                    }
+                    try {
+                        if (window._sharedData) {
+                            const media = window._sharedData?.entry_data?.PostPage?.[0]
+                                ?.graphql?.shortcode_media;
+                            if (media) {
+                                const vc = media.video_view_count ?? media.video_play_count;
+                                if (vc > 0) return String(vc);
+                            }
+                        }
+                    } catch(e) {}
 
-                    // Pattern 2: number in one text node, "views" in the next 1-3
-                    for (let i = 0; i < texts.length - 1; i++) {
-                        if (/^views?$/i.test(texts[i + 1]) ||
-                            (texts[i + 2] && /^views?$/i.test(texts[i + 2])) ||
-                            (texts[i + 3] && /^views?$/i.test(texts[i + 3]))) {
-                            const m = /^([\d,]+\.?\d*\s*[KMBkmb]?)$/.exec(texts[i]);
+                    // ── Strategy 2: inline <script> JSON blobs ────────────────────────
+                    try {
+                        const scripts = document.querySelectorAll('script[type="application/json"], script:not([src])');
+                        for (const s of scripts) {
+                            const txt = s.textContent || '';
+                            // look for video_view_count or play_count near a number
+                            const m = /"(?:video_view_count|play_count|video_play_count)"\s*:\s*(\d+)/.exec(txt);
+                            if (m && parseInt(m[1]) > 0) return m[1];
+                        }
+                    } catch(e) {}
+
+                    // ── Strategy 3: aria-label containing "X views" ───────────────────
+                    try {
+                        for (const el of document.querySelectorAll('[aria-label]')) {
+                            const label = el.getAttribute('aria-label') || '';
+                            const m = /([\d,]+\.?\d*\s*[KMBkmb]?)\s+views?/i.exec(label);
                             if (m) return m[1];
                         }
-                    }
+                    } catch(e) {}
 
-                    // Pattern 3: aria-label on any element containing "X views"
-                    const ariaEls = document.querySelectorAll('[aria-label]');
-                    for (const el of ariaEls) {
-                        const label = el.getAttribute('aria-label') || '';
-                        const m = /([\d,]+\.?\d*\s*[KMBkmb]?)\s+views?/i.exec(label);
-                        if (m) return m[1];
-                    }
+                    // ── Strategy 4 & 5: text-node walk ───────────────────────────────
+                    try {
+                        const walker = document.createTreeWalker(
+                            document.body, NodeFilter.SHOW_TEXT, null, false
+                        );
+                        const texts = [];
+                        let node;
+                        while ((node = walker.nextNode())) {
+                            const t = node.textContent.trim();
+                            if (t) texts.push(t);
+                        }
+
+                        // Single node: "1.2M views"
+                        for (const t of texts) {
+                            const m = /^([\d,]+\.?\d*\s*[KMBkmb]?)\s+views?$/i.exec(t);
+                            if (m) return m[1];
+                        }
+
+                        // Separate nodes: number then "views" within 4 positions
+                        for (let i = 0; i < texts.length - 1; i++) {
+                            const nearby = [texts[i+1], texts[i+2], texts[i+3]].filter(Boolean);
+                            if (nearby.some(t => /^views?$/i.test(t))) {
+                                const m = /^([\d,]+\.?\d*\s*[KMBkmb]?)$/.exec(texts[i]);
+                                if (m) return m[1];
+                            }
+                        }
+                    } catch(e) {}
 
                     return null;
                 }
