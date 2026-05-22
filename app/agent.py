@@ -503,14 +503,14 @@ class InstagramAgent:
 
         # ── 3. View / like threshold ──────────────────────────────────────────
         if not force:
-            if views < Config.MIN_VIEWS:
-                reason = f"Views {views:,} < threshold {Config.MIN_VIEWS:,}"
+            if Config.MIN_LIKES > 0 and likes < Config.MIN_LIKES:
+                reason = f"Likes {likes:,} < threshold {Config.MIN_LIKES:,}"
                 task.mark_skipped(reason, FailureKind.PERMANENT)
                 self.log.info(f"[{reel_id}] SKIP: {reason}")
                 self.db.mark_processed(reel_id, reel_url, "skipped", views, likes, reason)
                 return
-            if Config.MIN_LIKES > 0 and likes < Config.MIN_LIKES:
-                reason = f"Likes {likes:,} < threshold {Config.MIN_LIKES:,}"
+            if Config.MIN_VIEWS > 0 and views < Config.MIN_VIEWS:
+                reason = f"Views {views:,} < threshold {Config.MIN_VIEWS:,}"
                 task.mark_skipped(reason, FailureKind.PERMANENT)
                 self.log.info(f"[{reel_id}] SKIP: {reason}")
                 self.db.mark_processed(reel_id, reel_url, "skipped", views, likes, reason)
