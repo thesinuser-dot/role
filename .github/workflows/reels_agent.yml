@@ -83,50 +83,54 @@ jobs:
           rm -f "$HOME/.xsession"
 
           # ── Pre-configure XFCE4 to skip the first-run wizard ─────────────
-          # Without this, XFCE4 shows a blank blue screen and exits silently
-          # because it blocks on a "first run" dialog that has no display yet.
+          # Without this, XFCE4 shows a blank blue screen and exits silently.
+          # NOTE: We use printf, NOT heredoc, because YAML indentation would
+          # write leading spaces into the file, making the XML/shell invalid.
           mkdir -p "$HOME/.config/xfce4/xfconf/xfce-perchannel-xml"
 
-          cat > "$HOME/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-session.xml" << 'XML'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <channel name="xfce4-session" version="1.0">
-            <property name="general" type="empty">
-              <property name="SaveOnExit" type="bool" value="false"/>
-            </property>
-            <property name="startup" type="empty">
-              <property name="screensaver-disable" type="bool" value="true"/>
-            </property>
-          </channel>
-          XML
+          printf '%s\n' \
+            '<?xml version="1.0" encoding="UTF-8"?>' \
+            '<channel name="xfce4-session" version="1.0">' \
+            '  <property name="general" type="empty">' \
+            '    <property name="SaveOnExit" type="bool" value="false"/>' \
+            '  </property>' \
+            '  <property name="startup" type="empty">' \
+            '    <property name="screensaver-disable" type="bool" value="true"/>' \
+            '  </property>' \
+            '</channel>' \
+            > "$HOME/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-session.xml"
 
-          cat > "$HOME/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml" << 'XML'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <channel name="xfwm4" version="1.0">
-            <property name="general" type="empty">
-              <property name="use_compositing" type="bool" value="false"/>
-            </property>
-          </channel>
-          XML
+          printf '%s\n' \
+            '<?xml version="1.0" encoding="UTF-8"?>' \
+            '<channel name="xfwm4" version="1.0">' \
+            '  <property name="general" type="empty">' \
+            '    <property name="use_compositing" type="bool" value="false"/>' \
+            '  </property>' \
+            '</channel>' \
+            > "$HOME/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml"
 
           # ── Fix startwm.sh ────────────────────────────────────────────────
-          # Key points:
-          #   1. Unset DBUS_SESSION_BUS_ADDRESS so XRDP's PAM-created bus is used
-          #   2. Unset XDG_RUNTIME_DIR so XFCE doesn't fight XRDP over the socket
-          #   3. Set XDG_CURRENT_DESKTOP so XFCE panels load correctly
-          #   4. NO dbus-launch — XRDP handles DBus itself via PAM; adding
-          #      dbus-launch creates a second bus that causes XFCE to freeze/blue
-          sudo tee /etc/xrdp/startwm.sh > /dev/null << 'SH'
-          #!/bin/sh
-          if [ -r /etc/default/locale ]; then
-            . /etc/default/locale
-            export LANG LANGUAGE LC_ALL
-          fi
-          unset DBUS_SESSION_BUS_ADDRESS
-          unset XDG_RUNTIME_DIR
-          export XDG_CURRENT_DESKTOP=XFCE
-          export XDG_SESSION_DESKTOP=xfce
-          exec startxfce4
-          SH
+          # FIX: Use printf so the shebang lands at column 0 — heredocs in YAML
+          # inject leading spaces that break the #!/bin/sh line, causing XRDP to
+          # silently fail to launch the session (Image 1 "Error connecting to
+          # user session").
+          #
+          # dbus-run-session is used instead of bare startxfce4: on GitHub Actions
+          # the PAM D-Bus socket is not always available, so we start our own.
+          # This is different from dbus-launch (which forks a daemon), because
+          # dbus-run-session ties the bus lifetime to the session.
+          printf '%s\n' \
+            '#!/bin/sh' \
+            'if [ -r /etc/default/locale ]; then' \
+            '  . /etc/default/locale' \
+            '  export LANG LANGUAGE LC_ALL' \
+            'fi' \
+            'unset DBUS_SESSION_BUS_ADDRESS' \
+            'unset XDG_RUNTIME_DIR' \
+            'export XDG_CURRENT_DESKTOP=XFCE' \
+            'export XDG_SESSION_DESKTOP=xfce' \
+            'exec dbus-run-session -- startxfce4' \
+            | sudo tee /etc/xrdp/startwm.sh > /dev/null
           sudo chmod +x /etc/xrdp/startwm.sh
 
           sudo adduser xrdp ssl-cert 2>/dev/null || true
@@ -243,9 +247,10 @@ jobs:
                   print(f"[tg_send error] {e}")
 
           def get_rdp_display():
+              # FIX: only :10–:50 is the XRDP range; :99 is Xvfb (invisible)
               for s in sorted(glob.glob("/tmp/.X11-unix/X*")):
                   num = s.replace("/tmp/.X11-unix/X", "")
-                  if num.isdigit() and int(num) >= 10:
+                  if num.isdigit() and 10 <= int(num) <= 50:
                       return f":{num}"
               return None
 
@@ -319,7 +324,7 @@ jobs:
                   new = current - known
                   for s in new:
                       num = s.replace("/tmp/.X11-unix/X", "")
-                      if num.isdigit() and int(num) >= 10:
+                      if num.isdigit() and 10 <= int(num) <= 50:
                           disp = f":{num}"
                           print(f"[watcher] RDP client connected! Display {disp}")
                           addr = get_ngrok_addr()
@@ -411,8 +416,12 @@ jobs:
             if [[ -f /tmp/agent_display ]]; then
               cat /tmp/agent_display; return
             fi
+            # FIX: only match :10–:50 (XRDP range).
+            # The Xvfb fallback runs on :99, which was previously matched by the
+            # old '^X[1-9][0-9]+' regex, making the agent think Xvfb was an RDP
+            # session and running the hunt invisibly.
             ls /tmp/.X11-unix/ 2>/dev/null \
-              | grep -E '^X[1-9][0-9]+' \
+              | grep -E '^X[1-4][0-9]$' \
               | sort -t X -k2 -n \
               | head -1 \
               | sed 's/^X/:/'
