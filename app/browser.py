@@ -339,8 +339,7 @@ class BrowserManager:
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled",
-                "--disable-features=VizDisplayCompositor,IsolateOrigins",
-                "--disable-site-isolation-trials",
+                                "--disable-site-isolation-trials",
                 "--disable-web-security",
                 "--disable-extensions",
                 "--disable-default-apps",
@@ -356,8 +355,18 @@ class BrowserManager:
                 "--no-default-browser-check",
                 "--password-store=basic",
                 "--use-mock-keychain",
+                # ── Video playback ─────────────────────────────────────────
+                # Instagram serves H.264/AAC — ensure software decode is on
+                "--autoplay-policy=no-user-gesture-required",
+                "--enable-features=MediaFoundationH264Encoding",
+                "--disable-features=VizDisplayCompositor,IsolateOrigins,LegacyTLSEnforced",
+                "--force-color-profile=srgb",
+                "--enable-accelerated-video-decode",
+                "--enable-gpu-rasterization",
+                # ── Avoid triggering CDN bot-detection ─────────────────────
+                # Remove the explicit UA from args — it's set in context below,
+                # having it in both places sometimes creates a mismatch header
                 f"--window-size={Config.VIEWPORT_W},{Config.VIEWPORT_H}",
-                f"--user-agent={ua}",
             ],
         )
         self._ctx = self._browser.new_context(
