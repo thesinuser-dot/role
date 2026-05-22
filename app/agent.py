@@ -476,12 +476,9 @@ class InstagramAgent:
         except PlaywrightError as exc:
             self.log.warning(f"[{reel_id}] wait_for_selector error (non-fatal): {exc}")
 
-        # Wait for network to settle — Instagram stats are lazy-loaded via XHR
-        try:
-            page.wait_for_load_state("networkidle", timeout=8_000)
-        except Exception:
-            pass  # non-fatal
-        self.bm.delay(2500, 3500)
+        # NOTE: extract_metrics() calls wait_for_load_state("networkidle") itself.
+        # A second call here would add 8s+ of wasted wait per reel. Removed.
+        self.bm.delay(1000, 1500)
 
         # ── 2. Metrics ────────────────────────────────────────────────────────
         try:
