@@ -75,10 +75,19 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip3 install -r requirements.txt
 
-# ── Playwright Chromium ────────────────────────────────────────────────────────
-RUN playwright install chromium \
-    && playwright install-deps chromium \
-    && chmod -R 755 /ms-playwright
+# ── Chromium with proprietary codecs (H.264 / AAC for Instagram reels) ───────
+# Playwright's bundled Chromium ships without proprietary codecs and cannot
+# decode Instagram's H.264/AAC video streams ("Sorry, trouble playing video").
+# Use system chromium-browser + chromium-codecs-ffmpeg-extra instead.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        chromium-browser \
+        chromium-codecs-ffmpeg-extra \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install only Playwright's system deps (skip downloading its codec-stripped binary)
+RUN playwright install-deps chromium
+
+ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium-browser
 
 # ── Application source ─────────────────────────────────────────────────────────
 COPY agent.py       /app/agent.py
