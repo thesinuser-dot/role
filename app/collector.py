@@ -142,13 +142,28 @@ class ReelCollector:
 
     # ── Utilities ─────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def extract_reel_id(url: str) -> Optional[str]:
+    # Known non-ID path segments Instagram uses under /reels/
+    _GARBAGE_SEGMENTS = frozenset({"audio", "trending", "explore", "saved", "liked"})
+    # Valid reel IDs are Base64url — at least 8 chars
+    _REEL_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,}$")
+
+    @classmethod
+    def extract_reel_id(cls, url: str) -> Optional[str]:
         for pattern in (r"/reels?/([A-Za-z0-9_-]+)", r"/p/([A-Za-z0-9_-]+)"):
             m = re.search(pattern, url)
             if m:
-                return m.group(1)
+                candidate = m.group(1)
+                if (
+                    candidate not in cls._GARBAGE_SEGMENTS
+                    and cls._REEL_ID_RE.match(candidate)
+                ):
+                    return candidate
         return None
+
+    @staticmethod
+    def _is_valid_reel_url(url: str) -> bool:
+        """Accept only canonical /reels/{id}/ or /p/{id}/ URLs."""
+        return bool(re.search(r"instagram\.com/(?:reels?|p)/[A-Za-z0-9_-]{8,}", url))
 
     @staticmethod
     def _parse_count(text: str) -> int:
@@ -186,12 +201,20 @@ class ReelCollector:
     # ── Metrics extraction ────────────────────────────────────────────────────
 
     def extract_metrics(self) -> Dict[str, int]:
-        views = self._extract_count(
-            SelectorRegistry.VIEW_COUNT,
-            keyword="view",
-            exclude=None,
-            label="views",
-        )
+        # Give Instagram's lazy-loaded engagement section time to render
+        self._bm.delay(1500, 2500)
+
+        views = self._extract_views_js()
+        if views == 0:
+            # JS traversal failed — fall back to CSS selector approach
+            self.log.debug("JS view extraction got 0 — trying CSS fallback")
+            views = self._extract_count(
+                SelectorRegistry.VIEW_COUNT,
+                keyword="view",
+                exclude=None,
+                label="views",
+            )
+
         likes = self._extract_count(
             SelectorRegistry.LIKE_COUNT,
             keyword="like",
@@ -200,6 +223,63 @@ class ReelCollector:
         )
         self.log.info(f"Metrics: views={views:,}  likes={likes:,}")
         return {"views": views, "likes": likes}
+
+    def _extract_views_js(self) -> int:
+        """
+        Walk the DOM text nodes via JavaScript to find the view count.
+
+        Instagram renders the number and the 'views' label in separate sibling
+        spans, so CSS-selector-based approaches that require both to be in the
+        same element always return 0.  Walking text nodes and looking for a
+        numeric value adjacent to a 'views' label is far more robust.
+        """
+        try:
+            raw = self._page.evaluate("""
+                () => {
+                    const walker = document.createTreeWalker(
+                        document.body, NodeFilter.SHOW_TEXT, null, false
+                    );
+                    const texts = [];
+                    let node;
+                    while ((node = walker.nextNode())) {
+                        const t = node.textContent.trim();
+                        if (t) texts.push(t);
+                    }
+
+                    // Pattern 1: single text node like "1.2M views" or "12,345 views"
+                    for (const t of texts) {
+                        const m = /^([\d,]+\.?\d*\s*[KMBkmb]?)\s+views?$/i.exec(t);
+                        if (m) return m[1];
+                    }
+
+                    // Pattern 2: number in one text node, "views" in the next 1-3
+                    for (let i = 0; i < texts.length - 1; i++) {
+                        if (/^views?$/i.test(texts[i + 1]) ||
+                            (texts[i + 2] && /^views?$/i.test(texts[i + 2])) ||
+                            (texts[i + 3] && /^views?$/i.test(texts[i + 3]))) {
+                            const m = /^([\d,]+\.?\d*\s*[KMBkmb]?)$/.exec(texts[i]);
+                            if (m) return m[1];
+                        }
+                    }
+
+                    // Pattern 3: aria-label on any element containing "X views"
+                    const ariaEls = document.querySelectorAll('[aria-label]');
+                    for (const el of ariaEls) {
+                        const label = el.getAttribute('aria-label') || '';
+                        const m = /([\d,]+\.?\d*\s*[KMBkmb]?)\s+views?/i.exec(label);
+                        if (m) return m[1];
+                    }
+
+                    return null;
+                }
+            """)
+            if raw:
+                val = self._parse_count(str(raw))
+                self.log.debug(f"JS view extraction found: {raw!r} → {val:,}")
+                return val
+        except Exception as exc:
+            self.log.debug(f"JS view extraction error: {exc}")
+        return 0
 
     def _extract_count(
         self,
@@ -359,7 +439,7 @@ class ReelCollector:
                                 if href.startswith("/") else href
                             )
                             full = full.split("?")[0].rstrip("/") + "/"
-                            if full not in seen and ("/reel" in full or "/p/" in full):
+                            if full not in seen and self._is_valid_reel_url(full):
                                 seen.add(full)
                                 collected.append(full)
                                 self.log.debug(f"DOM link: {self.extract_reel_id(full)}")
@@ -374,9 +454,9 @@ class ReelCollector:
 
         def _capture_url_bar() -> None:
             current = self._page.url
-            if ("/reel" in current or "/p/" in current) and current not in seen:
-                seen.add(current)
-                clean = current.split("?")[0].rstrip("/") + "/"
+            clean = current.split("?")[0].rstrip("/") + "/"
+            if self._is_valid_reel_url(clean) and clean not in seen:
+                seen.add(clean)
                 collected.append(clean)
                 self.log.info(
                     f"[{len(collected)}/{Config.TARGET_REELS_SCAN}] "
