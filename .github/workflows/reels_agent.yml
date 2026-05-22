@@ -25,7 +25,7 @@ env:
   MAX_RUNTIME_SECONDS:     2400
   SHUTDOWN_BUFFER_SECONDS: 60
   PLAYWRIGHT_HEADLESS:     "false"
-  GEMINI_MODEL:            "gemini-1.5-flash"
+  GEMINI_MODEL:            "gemini-2.0-flash"
   GEMINI_MAX_DIM:          720
   TELEGRAM_MAX_VIDEO_MB:   49
   DB_PATH:                 history.db
