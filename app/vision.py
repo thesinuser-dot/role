@@ -16,7 +16,7 @@
 import logging
 import time
 from io import BytesIO
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 from PIL import Image
 import google.generativeai as genai
@@ -25,23 +25,43 @@ from config import Config
 
 
 class VisionEvaluator:
+    # الـ Prompt المطور لحل مشكلة الوجوه السينمائية والتفريق بين الـ Edits والـ Vlogs
     _GEMINI_PROMPT = (
-        "You are a zero-tolerance content quality filter for viral social media clips.\n"
-        "Inspect this video frame screenshot carefully.\n\n"
-        "Output exactly 'FAILED' if ANY of the following are present:\n"
-        "  - An @username, display name, or profile handle overlaid anywhere on the frame\n"
-        "  - TikTok watermark: spinning record icon, TikTok logo, username with music note\n"
-        "  - Instagram or Facebook watermark embedded INSIDE the video content\n"
-        "  - Any other social media platform logo or icon burned into the video\n"
-        "  - Horizontal black bars at both top AND bottom (letterboxed 16:9 in 9:16 frame)\n"
-        "  - Vertical black bars on both left AND right (pillarboxed 4:3 or wider)\n"
-        "  - Blurry, heavily compressed, or clearly low-resolution video quality\n"
-        "  - Hard-burned subtitle text overlaying the video content\n\n"
-        "Output exactly 'PASSED' if ALL of the following are true:\n"
-        "  - Native vertical 9:16 format — no black bars on any edge\n"
-        "  - No watermarks, handles, or platform branding anywhere in the frame\n"
-        "  - Clean, sharp, high-quality video content\n\n"
-        "Respond with exactly ONE word — either PASSED or FAILED. No other text."
+        "Role: You are a strict binary visual filter for a faceless/cinematic content aggregator. "
+        "Your sole task is to classify if this video frame is a high-quality EDIT/AESTHETIC clip or a PERSONAL/VLOG clip.\n\n"
+        
+        "CRITICAL RULE: Respond with EXACTLY ONE WORD: either 'PASSED' or 'FAILED'. "
+        "Do not include any punctuation, explanation, or extra characters. Fail closed if unsure.\n\n"
+        
+        "========================================= \n"
+        "REJECT AND OUTPUT 'FAILED' IF ANY OF THESE ARE TRUE:\n"
+        "========================================= \n"
+        "1. USER INTERFACE & BRANDING:\n"
+        "   - Contains platform watermarks (TikTok logo, Instagram Reels UI, YouTube shorts overlay).\n"
+        "   - Contains on-screen creator handles (e.g., @username) burned into the video as a permanent watermark.\n"
+        "2. FORMAT & QUALITY ISSUES:\n"
+        "   - Has horizontal black bars (Letterboxed) or vertical black bars (Pillarboxed).\n"
+        "   - Low resolution, blurry, pixelated, or poorly cropped.\n"
+        "3. PERSONAL / LIFESTYLE / UGC CONTENT:\n"
+        "   - Features an everyday person/influencer talking directly to the camera (Talking-head, Vlog style).\n"
+        "   - Looks like user-generated content (UGC), selfie-cam footage, GRWM (get ready with me), OOTD, or a lifestyle/travel vlog.\n"
+        "   - Shows real-life couples, family vlogs, or domestic personal context.\n"
+        "   - Features burned-in speech auto-captions/subtitles that follow a human voiceover (indicates a commentary vlog).\n\n"
+        
+        "========================================= \n"
+        "ACCEPT AND OUTPUT 'PASSED' ONLY IF ALL OF THESE ARE TRUE:\n"
+        "========================================= \n"
+        "1. NATIVE FORMAT: True native vertical 9:16 aspect ratio, edge-to-edge content without artificial borders.\n"
+        "2. NO BRANDING: 100% clean frame, free of third-party platform logos or creator handles.\n"
+        "3. ALLOWED CONTENT TYPES (Must match at least one):\n"
+        "   - Cinematic Edits: Scenes from movies, TV shows, or anime. NOTE: Fictional characters/actors (e.g., Homelander, Batman, Tommy Shelby) ARE fully allowed, even in close-ups, provided the footage is cinematic and NOT a personal vlog.\n"
+        "   - Automotive Footage: Professional/aesthetic car footage (drifting, rolling shots, car meets, luxury car close-ups).\n"
+        "   - Text/Quote Overlays: Deep, motivational, or relatable text written over a clean, artistic, or abstract background (e.g., night streets, rain, nature, scenery).\n"
+        "   - Gaming/AMV: High-quality gaming montages or anime music videos with clean transitions.\n\n"
+        
+        "Final Reminder: Look closely at the image. Is it a generic vlog/social media post? -> FAILED. "
+        "Is it a professional/faceless edit, cinematic clip, car video, or quote? -> PASSED.\n"
+        "Output ONLY 'PASSED' or 'FAILED'."
     )
 
     # Exceptions that indicate a transient Gemini error worth retrying
@@ -118,7 +138,7 @@ class VisionEvaluator:
         if max(img.width, img.height) > max_dim:
             scale = max_dim / max(img.width, img.height)
             img = img.resize(
-                (int(img.width * scale), int(img.height * scale)), Image.LANCZOS
+                (int(img.width * scale), int(img.height * scale)), Image.Resampling.LANCZOS
             )
         buf = BytesIO()
         img.save(buf, format="JPEG", quality=82, optimize=True)
@@ -137,8 +157,11 @@ class VisionEvaluator:
 
         for attempt in range(1, Config.GEMINI_RETRIES + 2):  # +2 = first try + N retries
             try:
+                # تجهيز هيكل البيانات الخاص بالصورة ليتناسب مع الـ SDK المستقر
+                image_part = {"mime_type": "image/jpeg", "data": compressed}
+                
                 response = self._model.generate_content(
-                    [self._GEMINI_PROMPT, {"mime_type": "image/jpeg", "data": compressed}],
+                    contents=[self._GEMINI_PROMPT, image_part],
                     generation_config=genai.types.GenerationConfig(
                         temperature=0.0, max_output_tokens=8
                     ),
@@ -150,6 +173,7 @@ class VisionEvaluator:
                     return True, "Gemini Vision: PASSED"
                 if "FAILED" in raw_text:
                     return False, "Gemini Vision: FAILED"
+                
                 # Ambiguous response — treat as FAILED, no retry needed
                 self.log.warning(f"Ambiguous Gemini response: '{raw_text}' — treating as FAILED")
                 return False, f"Gemini ambiguous response: '{raw_text}'"
@@ -167,7 +191,6 @@ class VisionEvaluator:
                     break
 
         # All attempts exhausted — fail closed.
-        # A broken API key or quota exhaustion must NOT silently pass every reel.
         self.log.error(
             f"Gemini failed after {Config.GEMINI_RETRIES + 1} attempt(s) (fail-closed): {last_exc}"
         )
