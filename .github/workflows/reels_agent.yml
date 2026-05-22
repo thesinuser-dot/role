@@ -22,7 +22,6 @@ env:
   MIN_VIEWS:               ${{ github.event.inputs.min_views  || '50000' }}
   MAX_QUALIFIED_SEND:      ${{ github.event.inputs.max_reels  || '5' }}
   TARGET_REELS_SCAN:       35
-  # FIX: was 480s (8 min) — collection alone takes 6+ min; each reel ~30s → need ~40 min total
   MAX_RUNTIME_SECONDS:     2400
   SHUTDOWN_BUFFER_SECONDS: 60
   PLAYWRIGHT_HEADLESS:     "false"
@@ -80,15 +79,54 @@ jobs:
           HASHED=$(openssl passwd -6 "${{ secrets.RDP_PASSWORD }}")
           sudo usermod --password "$HASHED" runner
 
-          # FIX: do NOT create ~/.xsession — it conflicts with startwm.sh
-          # (XRDP reads startwm.sh; a separate ~/.xsession causes a double-launch
-          #  that kills the session with "some problem / Error connecting to user session")
+          # ── Remove conflicting ~/.xsession ────────────────────────────────
           rm -f "$HOME/.xsession"
 
-          # FIX: use dbus-launch so the XFCE4 session has a D-Bus session bus.
-          # Without it xfce4 exits immediately → XRDP reports "some problem".
-          printf '#!/bin/sh\nif [ -r /etc/default/locale ]; then\n  . /etc/default/locale\n  export LANG LANGUAGE LC_ALL\nfi\nunset DBUS_SESSION_BUS_ADDRESS\nexec dbus-launch --exit-with-session startxfce4\n' \
-            | sudo tee /etc/xrdp/startwm.sh > /dev/null
+          # ── Pre-configure XFCE4 to skip the first-run wizard ─────────────
+          # Without this, XFCE4 shows a blank blue screen and exits silently
+          # because it blocks on a "first run" dialog that has no display yet.
+          mkdir -p "$HOME/.config/xfce4/xfconf/xfce-perchannel-xml"
+
+          cat > "$HOME/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-session.xml" << 'XML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <channel name="xfce4-session" version="1.0">
+            <property name="general" type="empty">
+              <property name="SaveOnExit" type="bool" value="false"/>
+            </property>
+            <property name="startup" type="empty">
+              <property name="screensaver-disable" type="bool" value="true"/>
+            </property>
+          </channel>
+          XML
+
+          cat > "$HOME/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml" << 'XML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <channel name="xfwm4" version="1.0">
+            <property name="general" type="empty">
+              <property name="use_compositing" type="bool" value="false"/>
+            </property>
+          </channel>
+          XML
+
+          # ── Fix startwm.sh ────────────────────────────────────────────────
+          # Key points:
+          #   1. Unset DBUS_SESSION_BUS_ADDRESS so XRDP's PAM-created bus is used
+          #   2. Unset XDG_RUNTIME_DIR so XFCE doesn't fight XRDP over the socket
+          #   3. Set XDG_CURRENT_DESKTOP so XFCE panels load correctly
+          #   4. NO dbus-launch — XRDP handles DBus itself via PAM; adding
+          #      dbus-launch creates a second bus that causes XFCE to freeze/blue
+          sudo tee /etc/xrdp/startwm.sh > /dev/null << 'SH'
+          #!/bin/sh
+          if [ -r /etc/default/locale ]; then
+            . /etc/default/locale
+            export LANG LANGUAGE LC_ALL
+          fi
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+          export XDG_CURRENT_DESKTOP=XFCE
+          export XDG_SESSION_DESKTOP=xfce
+          exec startxfce4
+          SH
           sudo chmod +x /etc/xrdp/startwm.sh
 
           sudo adduser xrdp ssl-cert 2>/dev/null || true
@@ -130,12 +168,6 @@ jobs:
 
           if not url:
               print("ERROR: Ngrok tunnel not found")
-              try:
-                  with open("/tmp/ngrok.log") as f:
-                      print("--- ngrok log ---")
-                      print(f.read()[-2000:])
-              except Exception as e:
-                  print(f"Could not read ngrok log: {e}")
               sys.exit(1)
 
           host = url.replace("tcp://", "").split(":")[0]
@@ -146,23 +178,22 @@ jobs:
               f.write(f"{host}:{port}")
 
           text = (
-              "RDP Session Ready\n\n"
+              "🖥️ RDP Ready — connect now\n\n"
               f"Windows:\nmstsc /v:{host}:{port}\n\n"
-              f"macOS:\nMicrosoft Remote Desktop -> {host}:{port}\n\n"
+              f"macOS:\nMicrosoft Remote Desktop → {host}:{port}\n\n"
               f"User: runner\n"
               f"Pass: your RDP_PASSWORD\n\n"
-              f"Commands:\n"
-              f"/resumeRDP - start agent & continue\n"
-              f"/reRDP     - get a new RDP link\n"
-              f"/desktop   - open terminal on your RDP screen\n"
-              f"/startdisplay - launch agent on your RDP screen now"
+              "Commands:\n"
+              "/resumeRDP — start agent\n"
+              "/reRDP     — new tunnel link\n"
+              "/desktop   — open terminal on screen\n"
+              "/startdisplay — run agent on your screen"
           )
 
           data = json.dumps({"chat_id": CHAT_ID, "text": text}).encode()
           req = urllib.request.Request(
               f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-              data=data,
-              headers={"Content-Type": "application/json"}
+              data=data, headers={"Content-Type": "application/json"}
           )
           try:
               with urllib.request.urlopen(req, timeout=10) as r:
@@ -183,15 +214,13 @@ jobs:
           GEMINI_API_KEY:            ${{ secrets.GEMINI_API_KEY }}
         run: |
           cat > /tmp/rdp_poller.py << 'PYEOF'
-          import os, json, time, subprocess, urllib.request, sys
+          import os, json, time, subprocess, urllib.request, sys, threading, glob
 
-          TOKEN    = os.environ["TELEGRAM_BOT_TOKEN"]
-          CHAT_ID  = str(os.environ["TELEGRAM_CHAT_ID"]).strip()
+          TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
+          CHAT_ID = str(os.environ["TELEGRAM_CHAT_ID"]).strip()
 
           def tg_get(method, params=None):
-              if params is None:
-                  params = {}
-              qs = "&".join(f"{k}={v}" for k, v in params.items())
+              qs = "&".join(f"{k}={v}" for k, v in (params or {}).items())
               try:
                   with urllib.request.urlopen(
                       f"https://api.telegram.org/bot{TOKEN}/{method}?{qs}", timeout=15
@@ -205,8 +234,7 @@ jobs:
               data = json.dumps({"chat_id": CHAT_ID, "text": text}).encode()
               req = urllib.request.Request(
                   f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                  data=data,
-                  headers={"Content-Type": "application/json"}
+                  data=data, headers={"Content-Type": "application/json"}
               )
               try:
                   with urllib.request.urlopen(req, timeout=10) as r:
@@ -215,25 +243,27 @@ jobs:
                   print(f"[tg_send error] {e}")
 
           def get_rdp_display():
-              import glob
-              sockets = glob.glob("/tmp/.X11-unix/X*")
-              for s in sorted(sockets):
+              for s in sorted(glob.glob("/tmp/.X11-unix/X*")):
                   num = s.replace("/tmp/.X11-unix/X", "")
                   if num.isdigit() and int(num) >= 10:
                       return f":{num}"
               return None
 
-          def get_ngrok_url():
-              for _ in range(20):
-                  try:
-                      with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels", timeout=3) as r:
-                          d = json.load(r)
-                          t = d.get("tunnels", [])
-                          if t:
-                              return t[0]["public_url"]
-                  except Exception:
-                      pass
-                  time.sleep(1)
+          def get_ngrok_addr():
+              try:
+                  with open("/tmp/ngrok_addr") as f:
+                      return f.read().strip()
+              except Exception:
+                  pass
+              try:
+                  with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels", timeout=3) as r:
+                      d = json.load(r)
+                      t = d.get("tunnels", [])
+                      if t:
+                          u = t[0]["public_url"].replace("tcp://", "")
+                          return u
+              except Exception:
+                  pass
               return None
 
           def restart_ngrok():
@@ -241,62 +271,82 @@ jobs:
               time.sleep(2)
               subprocess.Popen(
                   ["ngrok", "tcp", "3389", "--log=stdout", "--log-format=json"],
-                  stdout=open("/tmp/ngrok.log", "w"),
-                  stderr=subprocess.STDOUT
+                  stdout=open("/tmp/ngrok.log", "w"), stderr=subprocess.STDOUT
               )
-              url = get_ngrok_url()
-              if url:
-                  host = url.replace("tcp://", "").split(":")[0]
-                  port = url.replace("tcp://", "").split(":")[1]
+              time.sleep(5)
+              addr = get_ngrok_addr()
+              if addr:
+                  host, port = addr.split(":")
                   tg_send(
-                      f"New RDP link:\n\nmstsc /v:{host}:{port}\n\n"
+                      f"🔄 New RDP link:\n\nmstsc /v:{host}:{port}\n\n"
                       f"User: runner\n\n"
-                      f"/resumeRDP - start agent\n"
-                      f"/desktop - open terminal\n"
-                      f"/startdisplay - launch agent on screen\n"
-                      f"/reRDP - new link"
+                      "/resumeRDP /reRDP /desktop /startdisplay"
                   )
-                  print(f"New tunnel: {host}:{port}")
               else:
-                  tg_send("Failed to restart Ngrok.")
+                  tg_send("❌ Failed to restart Ngrok.")
 
           def cmd_desktop():
               disp = get_rdp_display()
               if not disp:
-                  tg_send("No RDP session found. Connect via RDP first, then send /desktop")
+                  tg_send("No RDP session. Connect first, then /desktop")
                   return
               env = os.environ.copy()
               env["DISPLAY"] = disp
-              subprocess.Popen(
-                  ["xfce4-terminal"],
-                  env=env,
-                  stdout=open("/tmp/terminal.log", "w"),
-                  stderr=subprocess.STDOUT
-              )
-              tg_send(f"Terminal opened on your RDP desktop (display {disp})")
-              print(f"Terminal launched on {disp}")
+              subprocess.Popen(["xfce4-terminal"], env=env,
+                  stdout=open("/tmp/terminal.log", "w"), stderr=subprocess.STDOUT)
+              tg_send(f"✅ Terminal opened on display {disp}")
 
           def cmd_startdisplay():
               disp = get_rdp_display()
               if not disp:
-                  tg_send("No RDP session found. Connect via RDP first, then send /startdisplay")
+                  tg_send("No RDP session. Connect first, then /startdisplay")
                   return
-              tg_send(
-                  f"Launching agent on your RDP screen ({disp})\n"
-                  f"Chromium will open on your desktop now!"
-              )
-              print(f"Starting agent on display {disp}")
+              tg_send(f"🚀 Launching agent on your screen ({disp})")
               with open("/tmp/agent_display", "w") as f:
                   f.write(disp)
               sys.exit(0)
 
+          # ── RDP connection watcher ────────────────────────────────────────
+          # Runs in background thread. Watches /tmp/.X11-unix/ for a new
+          # socket >= X10 (XRDP range) and sends Telegram alert the moment
+          # a Windows/Mac client connects — no manual command needed.
+          def rdp_connect_watcher():
+              known = set(glob.glob("/tmp/.X11-unix/X*"))
+              print("[watcher] Monitoring for RDP client connection...")
+              while True:
+                  time.sleep(2)
+                  current = set(glob.glob("/tmp/.X11-unix/X*"))
+                  new = current - known
+                  for s in new:
+                      num = s.replace("/tmp/.X11-unix/X", "")
+                      if num.isdigit() and int(num) >= 10:
+                          disp = f":{num}"
+                          print(f"[watcher] RDP client connected! Display {disp}")
+                          addr = get_ngrok_addr()
+                          msg = (
+                              f"✅ RDP client connected! Display {disp}\n\n"
+                              "Your desktop is live. You can now:\n"
+                              "• Browse the screen via Remote Desktop\n"
+                              "• /resumeRDP — start the Reels agent\n"
+                              "• /startdisplay — run agent ON your screen\n"
+                              "• /desktop — open a terminal\n"
+                          )
+                          if addr:
+                              host, port = addr.split(":")
+                              msg += f"\nTunnel still active: mstsc /v:{host}:{port}"
+                          tg_send(msg)
+                  known = current
+
+          t = threading.Thread(target=rdp_connect_watcher, daemon=True)
+          t.start()
+
+          # ── Main command poll loop ────────────────────────────────────────
           resp    = tg_get("getUpdates", {"limit": "1", "offset": "-1"})
           results = resp.get("result", [])
           offset  = (results[-1]["update_id"] + 1) if results else 0
           print(f"Polling from offset {offset}.")
-          print("Commands: /resumeRDP /reRDP /desktop /startdisplay")
 
-          for i in range(660):  # max 55 min
+          for i in range(660):
               resp    = tg_get("getUpdates", {"offset": str(offset), "limit": "10", "timeout": "4"})
               updates = resp.get("result", [])
 
@@ -305,24 +355,18 @@ jobs:
                   msg    = upd.get("message", {})
                   text   = msg.get("text", "").strip()
                   cid    = str(msg.get("chat", {}).get("id", "")).strip()
-
-                  print(f"  [msg] chat={cid} text={text!r}")
-
                   if cid != CHAT_ID:
                       continue
+                  print(f"  [cmd] {text!r}")
 
                   if text.startswith("/resumeRDP"):
-                      tg_send("Resuming agent now...")
-                      print("/resumeRDP — continuing")
+                      tg_send("▶️ Resuming agent...")
                       sys.exit(0)
-
                   elif text.startswith("/reRDP"):
-                      tg_send("Restarting RDP tunnel...")
+                      tg_send("🔄 Restarting tunnel...")
                       restart_ngrok()
-
                   elif text.startswith("/desktop"):
                       cmd_desktop()
-
                   elif text.startswith("/startdisplay"):
                       cmd_startdisplay()
 
@@ -365,8 +409,7 @@ jobs:
         run: |
           find_rdp_display() {
             if [[ -f /tmp/agent_display ]]; then
-              cat /tmp/agent_display
-              return
+              cat /tmp/agent_display; return
             fi
             ls /tmp/.X11-unix/ 2>/dev/null \
               | grep -E '^X[1-9][0-9]+' \
@@ -393,7 +436,6 @@ jobs:
           else
             echo "No RDP session — Xvfb fallback"
             sudo apt-get install -y --no-install-recommends xvfb -qq 2>/dev/null
-            # FIX: use 1920x1080 so Instagram renders at full desktop scale
             Xvfb :99 -screen 0 1920x1080x24 &
             sleep 2
             export DISPLAY=":99"
