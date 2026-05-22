@@ -1,0 +1,393 @@
+name: Reels AI Hunter 🎬
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"
+  workflow_dispatch:
+    inputs:
+      pause_for_rdp:
+        description: "Pause before agent so you can RDP in first (yes/no)"
+        required: false
+        default: "no"
+      min_views:
+        description: "Minimum view count"
+        required: false
+        default: "50000"
+      max_reels:
+        description: "Max reels to send"
+        required: false
+        default: "5"
+
+env:
+  MIN_VIEWS:               ${{ github.event.inputs.min_views  || '50000' }}
+  MAX_QUALIFIED_SEND:      ${{ github.event.inputs.max_reels  || '5' }}
+  TARGET_REELS_SCAN:       35
+  MAX_RUNTIME_SECONDS:     480
+  SHUTDOWN_BUFFER_SECONDS: 45
+  PLAYWRIGHT_HEADLESS:     "false"
+  GEMINI_MODEL:            "gemini-1.5-flash"
+  GEMINI_MAX_DIM:          720
+  TELEGRAM_MAX_VIDEO_MB:   49
+  DB_PATH:                 history.db
+  DOWNLOAD_DIR:            /tmp/reels_downloads
+  SCREENSHOT_DIR:          /tmp/reels_screenshots
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Restore history.db cache
+        uses: actions/cache@v4
+        with:
+          path: history.db
+          key: reels-history-db-${{ github.run_id }}
+          restore-keys: |
+            reels-history-db-
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update -qq
+          UBUNTU_VER=$(lsb_release -rs | cut -d. -f1)
+          if [[ "$UBUNTU_VER" -ge 24 ]]; then
+            ASOUND_PKG="libasound2t64"
+          else
+            ASOUND_PKG="libasound2"
+          fi
+          sudo apt-get install -y --no-install-recommends \
+            xfce4 xfce4-goodies xfce4-terminal \
+            xrdp dbus-x11 x11-xserver-utils \
+            ffmpeg \
+            fonts-liberation fonts-noto fonts-noto-color-emoji \
+            fonts-dejavu-core fonts-open-sans \
+            fontconfig \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+            libdbus-1-3 libxcomposite1 libxdamage1 libxext6 libxfixes3 \
+            libxrandr2 libgbm1 libxkbcommon0 libpango-1.0-0 \
+            libpangocairo-1.0-0 libcairo2 "$ASOUND_PKG" libgtk-3-0 \
+            libglib2.0-0 libx11-6 libx11-xcb1 libxcb1 libxss1 libxtst6 \
+            procps curl wget ca-certificates lsb-release
+          sudo fc-cache -fv
+
+      - name: Configure XRDP + XFCE4
+        run: |
+          HASHED=$(openssl passwd -6 "${{ secrets.RDP_PASSWORD }}")
+          sudo usermod --password "$HASHED" runner
+          echo "startxfce4" > "$HOME/.xsession"
+          chmod +x "$HOME/.xsession"
+          printf '#!/bin/sh\nif [ -r /etc/default/locale ]; then\n  . /etc/default/locale\n  export LANG LANGUAGE LC_ALL\nfi\nunset DBUS_SESSION_BUS_ADDRESS\nexec startxfce4\n' \
+            | sudo tee /etc/xrdp/startwm.sh > /dev/null
+          sudo chmod +x /etc/xrdp/startwm.sh
+          sudo adduser xrdp ssl-cert 2>/dev/null || true
+          sudo systemctl enable xrdp
+          sudo systemctl start xrdp
+          sleep 3
+          sudo systemctl is-active xrdp || (journalctl -u xrdp --no-pager -n 30 && exit 1)
+          echo "✅  XRDP is running on port 3389"
+
+      - name: Start Ngrok tunnel & notify Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          NGROK_AUTHTOKEN:    ${{ secrets.NGROK_AUTHTOKEN }}
+        run: |
+          curl -sSL https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz \
+            | sudo tar -xz -C /usr/local/bin
+          ngrok config add-authtoken "$NGROK_AUTHTOKEN"
+          ngrok tcp 3389 --log=stdout --log-format=json > /tmp/ngrok.log 2>&1 &
+
+          cat > /tmp/ngrok_notify.py << 'PYEOF'
+          import time, json, os, urllib.request, sys
+
+          TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
+          CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+
+          url = None
+          for _ in range(30):
+              try:
+                  with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels", timeout=3) as r:
+                      d = json.load(r)
+                      t = d.get("tunnels", [])
+                      if t:
+                          url = t[0]["public_url"]
+                          break
+              except Exception:
+                  pass
+              time.sleep(1)
+
+          if not url:
+              print("ERROR: Ngrok tunnel not found")
+              sys.exit(1)
+
+          host = url.replace("tcp://", "").split(":")[0]
+          port = url.replace("tcp://", "").split(":")[1]
+          print(f"Tunnel ready: {host}:{port}")
+
+          with open("/tmp/ngrok_addr", "w") as f:
+              f.write(f"{host}:{port}")
+
+          text = (
+              "RDP Session Ready\n\n"
+              f"Windows:\nmstsc /v:{host}:{port}\n\n"
+              f"macOS:\nMicrosoft Remote Desktop -> {host}:{port}\n\n"
+              f"User: runner\n"
+              f"Pass: your RDP_PASSWORD\n\n"
+              f"Commands:\n"
+              f"/resumeRDP - start agent & continue\n"
+              f"/reRDP     - get a new RDP link\n"
+              f"/desktop   - open terminal on your RDP screen\n"
+              f"/startdisplay - launch agent on your RDP screen now"
+          )
+
+          data = json.dumps({"chat_id": CHAT_ID, "text": text}).encode()
+          req = urllib.request.Request(
+              f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+              data=data,
+              headers={"Content-Type": "application/json"}
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=10) as r:
+                  result = json.load(r)
+                  print("Telegram OK" if result.get("ok") else f"Telegram error: {result}")
+          except Exception as e:
+              print(f"Telegram send failed: {e}")
+          PYEOF
+          python3 /tmp/ngrok_notify.py
+
+      - name: "Wait for Telegram commands"
+        if: ${{ github.event.inputs.pause_for_rdp == 'yes' }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          NGROK_AUTHTOKEN:    ${{ secrets.NGROK_AUTHTOKEN }}
+          INSTAGRAM_SESSION_COOKIES: ${{ secrets.INSTAGRAM_SESSION_COOKIES }}
+          GEMINI_API_KEY:            ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          cat > /tmp/rdp_poller.py << 'PYEOF'
+          import os, json, time, subprocess, urllib.request, sys
+
+          TOKEN    = os.environ["TELEGRAM_BOT_TOKEN"]
+          CHAT_ID  = str(os.environ["TELEGRAM_CHAT_ID"]).strip()
+
+          def tg_get(method, params=None):
+              if params is None:
+                  params = {}
+              qs = "&".join(f"{k}={v}" for k, v in params.items())
+              try:
+                  with urllib.request.urlopen(
+                      f"https://api.telegram.org/bot{TOKEN}/{method}?{qs}", timeout=15
+                  ) as r:
+                      return json.load(r)
+              except Exception as e:
+                  print(f"[tg_get error] {e}")
+                  return {}
+
+          def tg_send(text):
+              data = json.dumps({"chat_id": CHAT_ID, "text": text}).encode()
+              req = urllib.request.Request(
+                  f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                  data=data,
+                  headers={"Content-Type": "application/json"}
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=10) as r:
+                      return json.load(r)
+              except Exception as e:
+                  print(f"[tg_send error] {e}")
+
+          def get_rdp_display():
+              """Find the active XRDP display (X10, X11, etc.)"""
+              import glob
+              sockets = glob.glob("/tmp/.X11-unix/X*")
+              for s in sorted(sockets):
+                  num = s.replace("/tmp/.X11-unix/X", "")
+                  if num.isdigit() and int(num) >= 10:
+                      return f":{num}"
+              return None
+
+          def get_ngrok_url():
+              for _ in range(20):
+                  try:
+                      with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels", timeout=3) as r:
+                          d = json.load(r)
+                          t = d.get("tunnels", [])
+                          if t:
+                              return t[0]["public_url"]
+                  except Exception:
+                      pass
+                  time.sleep(1)
+              return None
+
+          def restart_ngrok():
+              subprocess.run(["pkill", "ngrok"], capture_output=True)
+              time.sleep(2)
+              subprocess.Popen(
+                  ["ngrok", "tcp", "3389", "--log=stdout", "--log-format=json"],
+                  stdout=open("/tmp/ngrok.log", "w"),
+                  stderr=subprocess.STDOUT
+              )
+              url = get_ngrok_url()
+              if url:
+                  host = url.replace("tcp://", "").split(":")[0]
+                  port = url.replace("tcp://", "").split(":")[1]
+                  tg_send(
+                      f"New RDP link:\n\nmstsc /v:{host}:{port}\n\n"
+                      f"User: runner\n\n"
+                      f"/resumeRDP - start agent\n"
+                      f"/desktop - open terminal\n"
+                      f"/startdisplay - launch agent on screen\n"
+                      f"/reRDP - new link"
+                  )
+                  print(f"New tunnel: {host}:{port}")
+              else:
+                  tg_send("Failed to restart Ngrok.")
+
+          def cmd_desktop():
+              """Open a terminal on the RDP desktop"""
+              disp = get_rdp_display()
+              if not disp:
+                  tg_send("No RDP session found. Connect via RDP first, then send /desktop")
+                  return
+              env = os.environ.copy()
+              env["DISPLAY"] = disp
+              subprocess.Popen(
+                  ["xfce4-terminal"],
+                  env=env,
+                  stdout=open("/tmp/terminal.log", "w"),
+                  stderr=subprocess.STDOUT
+              )
+              tg_send(f"Terminal opened on your RDP desktop (display {disp})")
+              print(f"Terminal launched on {disp}")
+
+          def cmd_startdisplay():
+              """Launch the agent on the RDP display so you can watch it"""
+              disp = get_rdp_display()
+              if not disp:
+                  tg_send("No RDP session found. Connect via RDP first, then send /startdisplay")
+                  return
+              tg_send(
+                  f"Launching agent on your RDP screen ({disp})\n"
+                  f"Chromium will open on your desktop now!"
+              )
+              print(f"Starting agent on display {disp}")
+              # Write display to file so the agent step picks it up
+              with open("/tmp/agent_display", "w") as f:
+                  f.write(disp)
+              sys.exit(0)  # exit poller — agent step will run next
+
+          # Get offset — only read NEW messages
+          resp    = tg_get("getUpdates", {"limit": "1", "offset": "-1"})
+          results = resp.get("result", [])
+          offset  = (results[-1]["update_id"] + 1) if results else 0
+          print(f"Polling from offset {offset}.")
+          print("Commands: /resumeRDP /reRDP /desktop /startdisplay")
+
+          for i in range(660):  # max 55 min
+              resp    = tg_get("getUpdates", {"offset": str(offset), "limit": "10", "timeout": "4"})
+              updates = resp.get("result", [])
+
+              for upd in updates:
+                  offset = upd["update_id"] + 1
+                  msg    = upd.get("message", {})
+                  text   = msg.get("text", "").strip()
+                  cid    = str(msg.get("chat", {}).get("id", "")).strip()
+
+                  print(f"  [msg] chat={cid} text={text!r}")
+
+                  if cid != CHAT_ID:
+                      continue
+
+                  if text.startswith("/resumeRDP"):
+                      tg_send("Resuming agent now...")
+                      print("/resumeRDP — continuing")
+                      sys.exit(0)
+
+                  elif text.startswith("/reRDP"):
+                      tg_send("Restarting RDP tunnel...")
+                      restart_ngrok()
+
+                  elif text.startswith("/desktop"):
+                      cmd_desktop()
+
+                  elif text.startswith("/startdisplay"):
+                      cmd_startdisplay()
+
+              time.sleep(5)
+
+          print("55-min timeout — continuing.")
+          PYEOF
+          python3 /tmp/rdp_poller.py
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright browsers
+        run: |
+          playwright install chromium
+          sudo apt-get install -y --no-install-recommends \
+            libwoff1 libopus0 libwebp7 libwebpdemux2 libenchant-2-2 \
+            libgudev-1.0-0 libsecret-1-0 libhyphen0 libmanette-0.2-0 \
+            libgles2 libgstreamer-gl1.0-0 libgstreamer-plugins-bad1.0-0 \
+            gstreamer1.0-plugins-bad libasound2t64 2>/dev/null || true
+
+      - name: Create runtime directories
+        run: |
+          mkdir -p /tmp/reels_downloads /tmp/reels_screenshots
+          sudo mkdir -p /var/log/reels-hunter
+          sudo chmod 777 /var/log/reels-hunter
+
+      - name: Run Reels AI Hunter agent
+        env:
+          INSTAGRAM_SESSION_COOKIES: ${{ secrets.INSTAGRAM_SESSION_COOKIES }}
+          GEMINI_API_KEY:            ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN:        ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:          ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          # Check if /startdisplay was used — use that display
+          # Otherwise detect XRDP display, fallback to Xvfb
+          if [[ -f /tmp/agent_display ]]; then
+            export DISPLAY=$(cat /tmp/agent_display)
+            echo "Using display from /startdisplay command: $DISPLAY"
+          else
+            XRDP_DISPLAY=$(ls /tmp/.X11-unix/ 2>/dev/null \
+              | grep -E '^X[1-9][0-9]+' | head -1 | sed 's/^X/:/')
+            if [[ -n "$XRDP_DISPLAY" ]]; then
+              export DISPLAY="$XRDP_DISPLAY"
+              echo "Using XRDP display: $DISPLAY"
+            else
+              echo "No RDP session — using Xvfb headless fallback"
+              sudo apt-get install -y --no-install-recommends xvfb -qq 2>/dev/null
+              Xvfb :99 -screen 0 1280x1024x24 &
+              sleep 2
+              export DISPLAY=":99"
+            fi
+          fi
+          echo "DISPLAY=$DISPLAY"
+          python3 app/agent.py 2>&1 | tee /var/log/reels-hunter/agent.log
+
+      - name: Upload screenshots & logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reels-debug-${{ github.run_id }}
+          path: |
+            /tmp/reels_screenshots/
+            /var/log/reels-hunter/
+          retention-days: 7
+
+      - name: Save history.db
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: history.db
+          key: reels-history-db-${{ github.run_id }}
