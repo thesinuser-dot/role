@@ -61,8 +61,8 @@ class Config:
 
     # ── Browser ────────────────────────────────────────────────────────────────
     HEADLESS: bool = os.environ.get("PLAYWRIGHT_HEADLESS", "false").strip().lower() == "true"
-    VIEWPORT_W: int = 430
-    VIEWPORT_H: int = 932
+    VIEWPORT_W: int = int(os.environ.get("VIEWPORT_W", "430"))
+    VIEWPORT_H: int = int(os.environ.get("VIEWPORT_H", "932"))
 
     USER_AGENTS: List[str] = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
