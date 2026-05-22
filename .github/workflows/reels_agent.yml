@@ -121,7 +121,8 @@ jobs:
           curl -sSL https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz \
             | sudo tar -xz -C /usr/local/bin
           ngrok config add-authtoken "$NGROK_AUTHTOKEN"
-          ngrok http ${WEB_PORT} --log=stdout --log-format=json > /tmp/ngrok.log 2>&1 &
+          ngrok http ${WEB_PORT} --log=stdout --log-format=json \
+            --request-header-add "ngrok-skip-browser-warning:true" > /tmp/ngrok.log 2>&1 &
 
           cat > /tmp/ngrok_notify.py << 'PYEOF'
           import time, json, os, urllib.request, sys
@@ -234,7 +235,8 @@ jobs:
               subprocess.run(["pkill", "ngrok"], capture_output=True)
               time.sleep(2)
               subprocess.Popen(
-                  ["ngrok", "http", WEB_PORT, "--log=stdout", "--log-format=json"],
+                  ["ngrok", "http", WEB_PORT, "--log=stdout", "--log-format=json",
+                   "--request-header-add", "ngrok-skip-browser-warning:true"],
                   stdout=open("/tmp/ngrok.log", "w"), stderr=subprocess.STDOUT
               )
               time.sleep(5)
