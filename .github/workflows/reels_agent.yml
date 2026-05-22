@@ -360,37 +360,44 @@ jobs:
           TELEGRAM_BOT_TOKEN:        ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:          ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          # ── Display resolution: prefer live RDP session ────────────────────
-          # /startdisplay wrote the display to file — use it directly
-          if [[ -f /tmp/agent_display ]]; then
-            export DISPLAY=$(cat /tmp/agent_display)
-            echo "Using display from /startdisplay: $DISPLAY"
-          else
-            # Wait up to 30s for an XRDP session to appear (user may still be
-            # connecting when /resumeRDP fires and this step starts)
-            echo "Waiting up to 30s for RDP session..."
-            XRDP_DISPLAY=""
-            for i in $(seq 1 6); do
-              XRDP_DISPLAY=$(ls /tmp/.X11-unix/ 2>/dev/null                 | grep -E '^X[1-9][0-9]+' | head -1 | sed 's/^X/:/')
-              if [[ -n "$XRDP_DISPLAY" ]]; then
-                echo "RDP display found on attempt $i: $XRDP_DISPLAY"
-                break
-              fi
-              echo "  attempt $i/6 — no RDP display yet, waiting 5s..."
-              sleep 5
-            done
+          # ── Display resolution: find the live RDP X session ───────────────
+          # XRDP creates an X socket in /tmp/.X11-unix/ when a client connects.
+          # It's always :10 or higher (Xvfb uses :99, never overlaps).
+          # We also check /tmp/agent_display (written by /startdisplay command).
 
-            if [[ -n "$XRDP_DISPLAY" ]]; then
-              export DISPLAY="$XRDP_DISPLAY"
-              echo "Using RDP display: $DISPLAY"
-            else
-              echo "No RDP session found — falling back to Xvfb headless"
-              sudo apt-get install -y --no-install-recommends xvfb -qq 2>/dev/null
-              Xvfb :99 -screen 0 1280x1024x24 &
-              sleep 2
-              export DISPLAY=":99"
+          find_rdp_display() {
+            # Method 1: explicit file from /startdisplay command
+            if [[ -f /tmp/agent_display ]]; then
+              cat /tmp/agent_display
+              return
             fi
+            # Method 2: any X socket >= :10 (XRDP range)
+            ls /tmp/.X11-unix/ 2>/dev/null               | grep -E '^X[1-9][0-9]+'               | sort -t X -k2 -n               | head -1               | sed 's/^X/:/'
+          }
+
+          echo "Waiting for RDP display (up to 60s)..."
+          RDP_DISP=""
+          for i in $(seq 1 12); do
+            RDP_DISP=$(find_rdp_display)
+            if [[ -n "$RDP_DISP" ]]; then
+              echo "RDP display found (attempt $i): $RDP_DISP"
+              break
+            fi
+            echo "  attempt $i/12 — not yet, waiting 5s..."
+            sleep 5
+          done
+
+          if [[ -n "$RDP_DISP" ]]; then
+            export DISPLAY="$RDP_DISP"
+            echo "Using RDP display: $DISPLAY"
+          else
+            echo "No RDP session — Xvfb fallback"
+            sudo apt-get install -y --no-install-recommends xvfb -qq 2>/dev/null
+            Xvfb :99 -screen 0 1280x1024x24 &
+            sleep 2
+            export DISPLAY=":99"
           fi
+
           echo "DISPLAY=$DISPLAY"
           python3 app/agent.py 2>&1 | tee /var/log/reels-hunter/agent.log
 
