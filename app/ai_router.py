@@ -1,241 +1,223 @@
-#!/usr/bin/env python3
-# ─────────────────────────────────────────────────────────────────────────────
-# ai_router.py — Best-effort LLM routing for text + hashtag generation
-#
-# Priority:
-#   1) Gemini (vision-capable; preferred when an image is available)
-#   2) Groq    (OpenAI-compatible text fallback)
-#   3) OpenRouter (OpenAI-compatible text fallback; can use openrouter/free)
-#
-# The router is intentionally conservative:
-#   - It never tries to "remove" watermarks, handles, or personal tags.
-#   - It only generates classification / metadata / hashtags for authorized use.
-# ─────────────────────────────────────────────────────────────────────────────
-
-from __future__ import annotations
-
+import os
+import json
+import asyncio
 import logging
-import re
 from typing import Optional
 
 import requests
 
-from config import Config
+logger = logging.getLogger("AIRouter")
 
-try:
-    import google.generativeai as genai
-except Exception:  # pragma: no cover - optional dependency
-    genai = None
+
+def parse_hashtags(text: str):
+    if not text:
+        return []
+
+    tags = []
+    words = text.replace("\n", " ").split()
+
+    for word in words:
+        if word.startswith("#"):
+            clean = "".join(c for c in word if c.isalnum() or c == "#")
+            if len(clean) > 1:
+                tags.append(clean.lower())
+
+    return list(dict.fromkeys(tags))[:15]
 
 
 class AIProviderRouter:
-    def __init__(self) -> None:
-        self.log = logging.getLogger("AIProviderRouter")
-        self._gemini_model = None
-        self._providers = [p for p in Config.AI_PROVIDER_ORDER if p in {"gemini", "groq", "openrouter"}]
+    def __init__(self):
+        self.gemini_key = os.getenv("GEMINI_API_KEY", "")
+        self.groq_key = os.getenv("GROQ_API_KEY", "")
+        self.openrouter_key = os.getenv("OPENROUTER_API_KEY", "")
 
-        if Config.GEMINI_API_KEY and genai is not None:
-            try:
-                genai.configure(api_key=Config.GEMINI_API_KEY)
-                self._gemini_model = genai.GenerativeModel(Config.GEMINI_MODEL)
-                self.log.info("Gemini text/vision provider ready: %s", Config.GEMINI_MODEL)
-            except Exception as exc:
-                self.log.warning("Gemini init failed: %s", exc)
-                self._gemini_model = None
+        self.gemini_model = os.getenv(
+            "GEMINI_MODEL",
+            "gemini-2.0-flash"
+        )
 
-    @property
-    def gemini_ready(self) -> bool:
-        return self._gemini_model is not None
+        self.groq_model = os.getenv(
+            "GROQ_MODEL",
+            "llama-3.3-70b-versatile"
+        )
 
-    def _response_text(self, response) -> Optional[str]:
-        if response is None:
-            return None
-        text = getattr(response, "text", None)
-        if isinstance(text, str) and text.strip():
-            return text.strip()
-        candidates = getattr(response, "candidates", None) or []
-        for cand in candidates:
-            content = getattr(cand, "content", None)
-            parts = getattr(content, "parts", None) or []
-            for part in parts:
-                ptext = getattr(part, "text", None)
-                if isinstance(ptext, str) and ptext.strip():
-                    return ptext.strip()
-        return None
+        self.openrouter_model = os.getenv(
+            "OPENROUTER_MODEL",
+            "meta-llama/llama-3.3-70b-instruct"
+        )
 
-    def _chat_completion(
+    async def generate(
         self,
-        *,
-        base_url: str,
-        api_key: str,
-        model: str,
-        prompt: str,
-        system_prompt: str,
-        timeout: int = 45,
-        max_tokens: int = 256,
-        extra_headers: Optional[dict] = None,
-    ) -> Optional[str]:
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-        if extra_headers:
-            headers.update(extra_headers)
+        prompt: str
+    ) -> str:
+
+        providers = [
+            ("gemini", self._gemini),
+            ("groq", self._groq),
+            ("openrouter", self._openrouter),
+        ]
+
+        last_error = None
+
+        for provider_name, provider_func in providers:
+
+            try:
+                logger.info(
+                    f"Trying provider: {provider_name}"
+                )
+
+                result = await provider_func(prompt)
+
+                if result:
+                    logger.info(
+                        f"{provider_name} success"
+                    )
+                    return result
+
+            except Exception as e:
+                last_error = e
+                err = str(e).lower()
+
+                quota_error = any(x in err for x in [
+                    "429",
+                    "quota",
+                    "resource_exhausted",
+                    "rate limit",
+                    "exceeded your current quota"
+                ])
+
+                if quota_error:
+                    logger.warning(
+                        f"{provider_name} quota exhausted -> fallback"
+                    )
+                    continue
+
+                logger.warning(
+                    f"{provider_name} failed: {e}"
+                )
+
+                await asyncio.sleep(1)
+
+        raise RuntimeError(
+            f"All AI providers failed: {last_error}"
+        )
+
+    async def _gemini(self, prompt: str):
+
+        if not self.gemini_key:
+            raise RuntimeError("Missing GEMINI_API_KEY")
+
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{self.gemini_model}:generateContent?key={self.gemini_key}"
+        )
 
         payload = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.2,
-            "max_tokens": max_tokens,
+            "contents": [
+                {
+                    "parts": [
+                        {
+                            "text": prompt
+                        }
+                    ]
+                }
+            ]
         }
 
-        resp = requests.post(base_url, headers=headers, json=payload, timeout=timeout)
-        resp.raise_for_status()
-        data = resp.json()
-        choices = data.get("choices") or []
-        if not choices:
-            return None
-        message = choices[0].get("message") or {}
-        content = message.get("content")
-        if isinstance(content, str) and content.strip():
-            return content.strip()
-        if isinstance(content, list):
-            parts = []
-            for item in content:
-                if isinstance(item, dict):
-                    txt = item.get("text")
-                    if isinstance(txt, str):
-                        parts.append(txt)
-            combined = "".join(parts).strip()
-            if combined:
-                return combined
-        return None
-
-    def _try_gemini(
-        self,
-        prompt: str,
-        image_bytes: Optional[bytes] = None,
-        mime_type: str = "image/jpeg",
-        max_output_tokens: int = 256,
-    ) -> Optional[str]:
-        if not self._gemini_model:
-            return None
-
-        contents = [prompt]
-        if image_bytes is not None:
-            contents.append({"mime_type": mime_type, "data": image_bytes})
-
-        response = self._gemini_model.generate_content(
-            contents=contents,
-            generation_config=genai.types.GenerationConfig(  # type: ignore[attr-defined]
-                temperature=0.0,
-                max_output_tokens=max_output_tokens,
-            ),
-            request_options={"timeout": 45},
-        )
-        return self._response_text(response)
-
-    def _try_groq(self, prompt: str, *, max_output_tokens: int = 256) -> Optional[str]:
-        if not Config.GROQ_API_KEY:
-            return None
-        return self._chat_completion(
-            base_url="https://api.groq.com/openai/v1/chat/completions",
-            api_key=Config.GROQ_API_KEY,
-            model=Config.GROQ_MODEL,
-            prompt=prompt,
-            system_prompt=(
-                "You are a concise assistant that returns only the requested text. "
-                "Do not add commentary unless explicitly asked."
-            ),
-            max_tokens=max_output_tokens,
+        response = requests.post(
+            url,
+            json=payload,
+            timeout=45
         )
 
-    def _try_openrouter(self, prompt: str, *, max_output_tokens: int = 256) -> Optional[str]:
-        if not Config.OPENROUTER_API_KEY:
-            return None
-        return self._chat_completion(
-            base_url="https://openrouter.ai/api/v1/chat/completions",
-            api_key=Config.OPENROUTER_API_KEY,
-            model=Config.OPENROUTER_MODEL,
-            prompt=prompt,
-            system_prompt=(
-                "You are a concise assistant that returns only the requested text. "
-                "Do not add commentary unless explicitly asked."
-            ),
-            max_tokens=max_output_tokens,
-            extra_headers={
-                "HTTP-Referer": "https://chat.openai.com",
-                "X-Title": Config.OPENROUTER_APP_NAME,
-            },
+        if response.status_code != 200:
+            raise RuntimeError(response.text)
+
+        data = response.json()
+
+        return (
+            data["candidates"][0]
+            ["content"]["parts"][0]["text"]
         )
 
-    def complete(
-        self,
-        prompt: str,
-        *,
-        image_bytes: Optional[bytes] = None,
-        mime_type: str = "image/jpeg",
-        max_output_tokens: int = 256,
-    ) -> Optional[str]:
-        """
-        Best-effort completion with provider fallback.
-        Gemini is tried first for image inputs. If it is unavailable or fails,
-        text-only fallbacks are tried in the configured provider order.
-        """
-        tried = []
+    async def _groq(self, prompt: str):
 
-        # 1) Gemini gets first crack, especially when we have an image.
-        if "gemini" in self._providers and self._gemini_model is not None:
-            tried.append("gemini")
-            try:
-                result = self._try_gemini(
-                    prompt,
-                    image_bytes=image_bytes,
-                    mime_type=mime_type,
-                    max_output_tokens=max_output_tokens,
-                )
-                if result:
-                    return result
-            except Exception as exc:
-                self.log.warning("Gemini request failed: %s", exc)
+        if not self.groq_key:
+            raise RuntimeError("Missing GROQ_API_KEY")
 
-        # 2) Text-only fallbacks.
-        for provider in self._providers:
-            if provider in tried:
-                continue
-            try:
-                if provider == "groq":
-                    result = self._try_groq(prompt, max_output_tokens=max_output_tokens)
-                elif provider == "openrouter":
-                    result = self._try_openrouter(prompt, max_output_tokens=max_output_tokens)
-                else:
-                    continue
-                if result:
-                    return result
-            except Exception as exc:
-                self.log.warning("%s request failed: %s", provider, exc)
+        url = "https://api.groq.com/openai/v1/chat/completions"
 
-        return None
+        headers = {
+            "Authorization": f"Bearer {self.groq_key}",
+            "Content-Type": "application/json",
+        }
 
+        payload = {
+            "model": self.groq_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "temperature": 0.3,
+        }
 
-_HASHTAG_RE = re.compile(r"#[A-Za-z0-9_]{2,}")
+        response = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=45
+        )
 
+        if response.status_code != 200:
+            raise RuntimeError(response.text)
 
-def parse_hashtags(raw_text: str, limit: int = 10) -> list[str]:
-    """Extract and normalize hashtags from model output."""
-    if not raw_text:
-        return []
+        data = response.json()
 
-    seen: set[str] = set()
-    tags: list[str] = []
-    for tag in _HASHTAG_RE.findall(raw_text):
-        clean = "#" + tag.lstrip("#").lower()
-        if clean not in seen:
-            seen.add(clean)
-            tags.append(clean)
-        if len(tags) >= limit:
-            break
-    return tags
+        return (
+            data["choices"][0]
+            ["message"]["content"]
+        )
+
+    async def _openrouter(self, prompt: str):
+
+        if not self.openrouter_key:
+            raise RuntimeError(
+                "Missing OPENROUTER_API_KEY"
+            )
+
+        url = "https://openrouter.ai/api/v1/chat/completions"
+
+        headers = {
+            "Authorization": f"Bearer {self.openrouter_key}",
+            "Content-Type": "application/json",
+        }
+
+        payload = {
+            "model": self.openrouter_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "temperature": 0.3,
+        }
+
+        response = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=45
+        )
+
+        if response.status_code != 200:
+            raise RuntimeError(response.text)
+
+        data = response.json()
+
+        return (
+            data["choices"][0]
+            ["message"]["content"]
+        )
