@@ -227,26 +227,93 @@ class TikTokPoster:
             return None
         return cookies_path
 
+    def _do_upload(self, video_path: Path, caption: str) -> None:
+        """Call upload_video with current cookies path."""
+        upload_video(
+            filename=str(video_path),
+            description=caption,
+            cookies=str(self._cookies_path),
+            headless=Config.TIKTOK_HEADLESS,
+            schedule=None,
+        )
+
+    def _manual_login_and_save_cookies(self) -> bool:
+        """
+        Open a visible TikTok browser, log in with email+password, then export
+        the fresh session cookies to a temp file so subsequent uploads work.
+        Returns True if login succeeded.
+        """
+        email    = Config.TIKTOK_EMAIL.strip()
+        password = Config.TIKTOK_PASSWORD.strip()
+        if not email or not password:
+            log.warning("No TIKTOK_EMAIL/TIKTOK_PASSWORD set — cannot manual login.")
+            return False
+
+        log.info("TikTok: attempting manual login via browser...")
+        try:
+            from playwright.sync_api import sync_playwright
+            import json as _json
+
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=False)
+                ctx     = browser.new_context()
+                page    = ctx.new_page()
+
+                page.goto("https://www.tiktok.com/login/phone-or-email/email",
+                          wait_until="domcontentloaded", timeout=30_000)
+                time.sleep(2)
+
+                # Fill email
+                page.fill("input[name='username'], input[type='text']", email)
+                time.sleep(0.5)
+                # Fill password
+                page.fill("input[type='password']", password)
+                time.sleep(0.5)
+                # Submit
+                page.keyboard.press("Enter")
+                time.sleep(6)  # wait for redirect + session cookie to be set
+
+                # Check logged in
+                if "tiktok.com" in page.url and "login" not in page.url:
+                    log.info("TikTok manual login succeeded ✅")
+                    # Export cookies in Netscape format
+                    raw_cookies = ctx.cookies()
+                    tmp = tempfile.NamedTemporaryFile(
+                        suffix=".txt", prefix="tiktok_login_cookies_", delete=False
+                    )
+                    tmp.write(b"# Netscape HTTP Cookie File\n\n")
+                    for c in raw_cookies:
+                        secure  = "TRUE" if c.get("secure") else "FALSE"
+                        http    = "TRUE" if c.get("httpOnly") else "FALSE"
+                        expires = str(int(c.get("expires", 9999999999)))
+                        line = (
+                            f"{c['domain']}\t{http}\t{c['path']}\t"
+                            f"{secure}\t{expires}\t{c['name']}\t{c['value']}\n"
+                        )
+                        tmp.write(line.encode())
+                    tmp.close()
+                    self._temp_cookies    = Path(tmp.name)
+                    self._cookies_path    = Path(tmp.name)
+                    log.info(f"TikTok cookies saved to {tmp.name}")
+                    browser.close()
+                    return True
+                else:
+                    log.error("TikTok manual login failed — still on login page.")
+                    browser.close()
+                    return False
+
+        except Exception as exc:
+            log.error(f"TikTok manual login error: {exc}")
+            return False
+
     def _upload_with_timeout(self, video_path: Path, caption: str) -> None:
         """Run upload_video with a hard timeout on Unix-like systems."""
         if Config.TIKTOK_UPLOAD_TIMEOUT_SECONDS <= 0:
-            upload_video(
-                filename=str(video_path),
-                description=caption,
-                cookies=str(self._cookies_path),
-                headless=Config.TIKTOK_HEADLESS,
-                schedule=None,
-            )
+            self._do_upload(video_path, caption)
             return
 
         if not hasattr(signal, "SIGALRM"):
-            upload_video(
-                filename=str(video_path),
-                description=caption,
-                cookies=str(self._cookies_path),
-                headless=Config.TIKTOK_HEADLESS,
-                schedule=None,
-            )
+            self._do_upload(video_path, caption)
             return
 
         class _UploadTimeout(Exception):
@@ -258,13 +325,7 @@ class TikTokPoster:
         old_handler = signal.signal(signal.SIGALRM, _handler)
         try:
             signal.setitimer(signal.ITIMER_REAL, float(Config.TIKTOK_UPLOAD_TIMEOUT_SECONDS))
-            upload_video(
-                filename=str(video_path),
-                description=caption,
-                cookies=str(self._cookies_path),
-                headless=Config.TIKTOK_HEADLESS,
-                schedule=None,
-            )
+            self._do_upload(video_path, caption)
         finally:
             try:
                 signal.setitimer(signal.ITIMER_REAL, 0)
@@ -308,10 +369,18 @@ class TikTokPoster:
                 return True
 
             except Exception as exc:
+                err_str = str(exc).lower()
                 log.warning(
                     f"[TikTok] Upload attempt {attempt}/{Config.TIKTOK_MAX_RETRIES} "
                     f"failed: {exc}"
                 )
+                # If it looks like an auth/login error, try manual login once
+                if any(kw in err_str for kw in ("login", "sign in", "session", "auth", "cookie", "expired")):
+                    log.info("[TikTok] Auth error detected — attempting manual login...")
+                    if self._manual_login_and_save_cookies():
+                        log.info("[TikTok] Manual login done — retrying upload immediately...")
+                        continue  # retry this attempt with fresh cookies
+
                 if attempt < Config.TIKTOK_MAX_RETRIES:
                     sleep_s = 2 ** attempt
                     log.info(f"[TikTok] Retrying in {sleep_s}s...")
