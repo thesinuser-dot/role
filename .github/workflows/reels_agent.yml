@@ -71,8 +71,7 @@ jobs:
           fi
 
           sudo apt-get install -y --no-install-recommends \
-            xvfb x11vnc novnc websockify \
-            fluxbox xterm dbus-x11 x11-xserver-utils x11-utils \
+            xvfb fluxbox xterm dbus-x11 x11-xserver-utils x11-utils \
             ffmpeg \
             fonts-liberation fonts-noto fonts-noto-color-emoji \
             fonts-dejavu-core fonts-open-sans \
@@ -83,6 +82,7 @@ jobs:
             libpangocairo-1.0-0 libcairo2 "$ASOUND_PKG" libgtk-3-0 \
             libglib2.0-0 libx11-6 libx11-xcb1 libxcb1 libxss1 libxtst6 \
             procps curl wget ca-certificates lsb-release \
+            gnupg \
             xdotool \
             xclip
           sudo fc-cache -fv
@@ -95,24 +95,50 @@ jobs:
             chromium-chromedriver
           chromium-browser --version
 
-      - name: Start virtual desktop (noVNC)
+      - name: Start virtual desktop (Xpra HTML5)
         run: |
-          Xvfb "$DISPLAY" -screen 0 1440x2560x24 -ac &
-          sleep 2
+          # Install Xpra from official repo (replaces Xvfb + x11vnc + websockify + noVNC)
+          wget -qO /tmp/xpra.gpg https://xpra.org/repos/jammy/xpra.gpg
+          sudo install -o root -g root -m 644 /tmp/xpra.gpg /usr/share/keyrings/xpra.gpg
+          echo "deb [signed-by=/usr/share/keyrings/xpra.gpg] https://xpra.org/repos/jammy jammy main" \
+            | sudo tee /etc/apt/sources.list.d/xpra.list
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends xpra xpra-html5
 
-          DISPLAY="$DISPLAY" fluxbox > /tmp/fluxbox.log 2>&1 &
-          sleep 1
+          sudo mkdir -p /run/xpra
+          sudo chmod 1777 /run/xpra
 
-          x11vnc -display "$DISPLAY" -nopw -listen localhost \
-            -xkb -forever -shared -quiet > /tmp/x11vnc.log 2>&1 &
-          sleep 2
+          xpra start-desktop "$DISPLAY" \
+            --bind-tcp=0.0.0.0:${WEB_PORT} \
+            --html=on \
+            --start=fluxbox \
+            --daemon=no \
+            --pixel-depth=24 \
+            --dpi=96 \
+            --desktop-scaling=off \
+            --opengl=no \
+            --no-mdns \
+            --no-notifications \
+            --no-bell \
+            --no-pulseaudio \
+            --speaker=off \
+            --microphone=off \
+            --webcam=no \
+            --clipboard=no \
+            --file-transfer=no \
+            --printing=no \
+            > /tmp/xpra.log 2>&1 &
 
-          websockify --web /usr/share/novnc/ \
-            --wrap-mode=ignore \
-            ${WEB_PORT} localhost:5900 > /tmp/novnc.log 2>&1 &
-          sleep 2
+          # Wait for Xpra to be ready (up to 30s)
+          for i in $(seq 1 30); do
+            if xpra info "$DISPLAY" >/dev/null 2>&1; then
+              echo "Xpra ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
 
-          echo "noVNC ready -- http://localhost:${WEB_PORT}/vnc.html?autoconnect=true"
+          echo "Desktop ready -- http://localhost:${WEB_PORT}/"
 
       - name: Start Ngrok tunnel and notify Telegram
         env:
@@ -155,7 +181,7 @@ jobs:
 
           text = (
               "Desktop Ready -- open in your browser:\n\n"
-              f"{url}/vnc.html?autoconnect=true\n\n"
+              f"{url}/\n\n"
               "No app needed -- just click the link above.\n\n"
               "Commands:\n"
               "/resume    -- start the Reels agent\n"
@@ -245,7 +271,7 @@ jobs:
               if url:
                   with open("/tmp/ngrok_url", "w") as f:
                       f.write(url)
-                  tg_send(f"New desktop link:\n\n{url}/vnc.html?autoconnect=true\n\n/resume /newlink /desktop")
+                  tg_send(f"New desktop link:\n\n{url}/\n\n/resume /newlink /desktop")
               else:
                   tg_send("Failed to restart Ngrok.")
 
