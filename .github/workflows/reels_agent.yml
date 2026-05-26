@@ -1,4 +1,4 @@
-name: Reels AI Hunter 🎬
+name: Reels AI Hunter
 
 on:
   schedule:
@@ -17,6 +17,14 @@ on:
         description: "Max reels to send"
         required: false
         default: "5"
+      tiktok_enabled:
+        description: "Auto-post to TikTok (true/false)"
+        required: false
+        default: "false"
+
+concurrency:
+  group: reels-hunter-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   MIN_VIEWS:               ${{ github.event.inputs.min_views  || '50000' }}
@@ -37,6 +45,8 @@ env:
   VIEWPORT_W:              "720"
   VIEWPORT_H:              "1280"
   PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: /usr/bin/chromium-browser
+  TIKTOK_ENABLED:          ${{ github.event.inputs.tiktok_enabled || 'false' }}
+  TIKTOK_HEADLESS:         "true"
 
 jobs:
   hunt:
@@ -85,34 +95,30 @@ jobs:
         run: |
           sudo apt-get install -y --no-install-recommends \
             chromium-browser \
-            chromium-codecs-ffmpeg-extra
-          # Verify codec build has H.264
+            chromium-codecs-ffmpeg-extra \
+            chromium-chromedriver
           chromium-browser --version
 
       - name: Start virtual desktop (noVNC)
         run: |
-          # Virtual display
           Xvfb "$DISPLAY" -screen 0 1440x2560x24 -ac &
           sleep 2
 
-          # Window manager
           DISPLAY="$DISPLAY" fluxbox > /tmp/fluxbox.log 2>&1 &
           sleep 1
 
-          # VNC server on localhost:5900 (no password)
           x11vnc -display "$DISPLAY" -nopw -listen localhost \
             -xkb -forever -shared -quiet > /tmp/x11vnc.log 2>&1 &
           sleep 2
 
-          # noVNC web client on WEB_PORT → forwards to VNC
           websockify --web /usr/share/novnc/ \
             --wrap-mode=ignore \
             ${WEB_PORT} localhost:5900 > /tmp/novnc.log 2>&1 &
           sleep 2
 
-          echo "✅  noVNC ready — http://localhost:${WEB_PORT}/vnc.html?autoconnect=true"
+          echo "noVNC ready -- http://localhost:${WEB_PORT}/vnc.html?autoconnect=true"
 
-      - name: Start Ngrok tunnel & notify Telegram
+      - name: Start Ngrok tunnel and notify Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -124,7 +130,7 @@ jobs:
           ngrok http ${WEB_PORT} --log=stdout --log-format=json \
             --request-header-add "ngrok-skip-browser-warning:true" > /tmp/ngrok.log 2>&1 &
 
-          cat > /tmp/ngrok_notify.py << 'PYEOF'
+          python3 - << 'PYEOF'
           import time, json, os, urllib.request, sys
 
           TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -152,13 +158,13 @@ jobs:
               f.write(url)
 
           text = (
-              "🖥️ Desktop Ready — open in your browser:\n\n"
+              "Desktop Ready -- open in your browser:\n\n"
               f"{url}/vnc.html?autoconnect=true\n\n"
-              "No app needed — just click the link above.\n\n"
+              "No app needed -- just click the link above.\n\n"
               "Commands:\n"
-              "/resume    — start the Reels agent\n"
-              "/newlink   — get a fresh tunnel URL\n"
-              "/desktop   — open a terminal on screen\n"
+              "/resume    -- start the Reels agent\n"
+              "/newlink   -- get a fresh tunnel URL\n"
+              "/desktop   -- open a terminal on screen\n"
           )
 
           data = json.dumps({"chat_id": CHAT_ID, "text": text}).encode()
@@ -173,23 +179,22 @@ jobs:
           except Exception as e:
               print(f"Telegram send failed: {e}")
           PYEOF
-          python3 /tmp/ngrok_notify.py
 
-      - name: "Wait for Telegram commands"
+      - name: Wait for Telegram commands
         if: ${{ github.event.inputs.pause_for_desktop == 'yes' }}
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          NGROK_AUTHTOKEN:    ${{ secrets.NGROK_AUTHTOKEN }}
+          TELEGRAM_BOT_TOKEN:        ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:          ${{ secrets.TELEGRAM_CHAT_ID }}
+          NGROK_AUTHTOKEN:           ${{ secrets.NGROK_AUTHTOKEN }}
           INSTAGRAM_SESSION_COOKIES: ${{ secrets.INSTAGRAM_SESSION_COOKIES }}
           GEMINI_API_KEY:            ${{ secrets.GEMINI_API_KEY }}
         run: |
-          cat > /tmp/desktop_poller.py << 'PYEOF'
+          python3 - << 'PYEOF'
           import os, json, time, subprocess, urllib.request, sys
 
-          TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
-          CHAT_ID = str(os.environ["TELEGRAM_CHAT_ID"]).strip()
-          DISPLAY = os.environ.get("DISPLAY", ":99")
+          TOKEN    = os.environ["TELEGRAM_BOT_TOKEN"]
+          CHAT_ID  = str(os.environ["TELEGRAM_CHAT_ID"]).strip()
+          DISP     = os.environ.get("DISPLAY", ":99")
           WEB_PORT = os.environ.get("WEB_PORT", "8080")
 
           def tg_get(method, params=None):
@@ -244,25 +249,21 @@ jobs:
               if url:
                   with open("/tmp/ngrok_url", "w") as f:
                       f.write(url)
-                  tg_send(
-                      f"🔄 New desktop link:\n\n{url}/vnc.html?autoconnect=true\n\n"
-                      "/resume /newlink /desktop"
-                  )
+                  tg_send(f"New desktop link:\n\n{url}/vnc.html?autoconnect=true\n\n/resume /newlink /desktop")
               else:
-                  tg_send("❌ Failed to restart Ngrok.")
+                  tg_send("Failed to restart Ngrok.")
 
           def cmd_desktop():
               env = os.environ.copy()
-              env["DISPLAY"] = DISPLAY
+              env["DISPLAY"] = DISP
               subprocess.Popen(
                   ["xterm", "-fa", "Monospace", "-fs", "12"],
                   env=env,
                   stdout=open("/tmp/terminal.log", "w"),
                   stderr=subprocess.STDOUT,
               )
-              tg_send(f"✅ Terminal opened on display {DISPLAY}")
+              tg_send(f"Terminal opened on display {DISP}")
 
-          # ── Main command poll loop ────────────────────────────────────────
           resp    = tg_get("getUpdates", {"limit": "1", "offset": "-1"})
           results = resp.get("result", [])
           offset  = (results[-1]["update_id"] + 1) if results else 0
@@ -282,19 +283,18 @@ jobs:
                   print(f"  [cmd] {text!r}")
 
                   if text.startswith("/resume"):
-                      tg_send("▶️ Resuming agent...")
+                      tg_send("Resuming agent...")
                       sys.exit(0)
                   elif text.startswith("/newlink"):
-                      tg_send("🔄 Restarting tunnel...")
+                      tg_send("Restarting tunnel...")
                       restart_ngrok()
                   elif text.startswith("/desktop"):
                       cmd_desktop()
 
               time.sleep(5)
 
-          print("55-min timeout — continuing.")
+          print("55-min timeout -- continuing.")
           PYEOF
-          python3 /tmp/desktop_poller.py
 
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
@@ -312,7 +312,7 @@ jobs:
             libwoff1 libopus0 libwebp7 libwebpdemux2 libenchant-2-2 \
             libgudev-1.0-0 libsecret-1-0 libhyphen0 libmanette-0.2-0 \
             libgles2 libgstreamer-gl1.0-0 libgstreamer-plugins-bad1.0-0 \
-            gstreamer1.0-plugins-bad libasound2t64 2>/dev/null || true
+            gstreamer1.0-plugins-bad 2>/dev/null || true
 
       - name: Create runtime directories
         run: |
@@ -320,17 +320,32 @@ jobs:
           sudo mkdir -p /var/log/reels-hunter
           sudo chmod 777 /var/log/reels-hunter
 
+      - name: Write TikTok cookies file
+        if: ${{ github.event.inputs.tiktok_enabled == 'true' || env.TIKTOK_ENABLED == 'true' }}
+        env:
+          TIKTOK_COOKIES: ${{ secrets.TIKTOK_COOKIES }}
+        run: |
+          mkdir -p /run/secrets
+          if [ -n "$TIKTOK_COOKIES" ]; then
+            echo "$TIKTOK_COOKIES" | base64 -d > /run/secrets/tiktok_cookies.txt
+            echo "TikTok cookies written."
+          else
+            echo "TIKTOK_COOKIES secret not set -- TikTok posting will be skipped."
+          fi
+
       - name: Run Reels AI Hunter agent
         env:
           INSTAGRAM_SESSION_COOKIES: ${{ secrets.INSTAGRAM_SESSION_COOKIES }}
           GEMINI_API_KEY:            ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN:        ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:          ${{ secrets.TELEGRAM_CHAT_ID }}
+          TIKTOK_SESSION_ID:         ${{ secrets.TIKTOK_SESSION_ID }}
+          TIKTOK_COOKIES_FILE:       /run/secrets/tiktok_cookies.txt
         run: |
           echo "DISPLAY=$DISPLAY"
           python3 app/agent.py 2>&1 | tee /var/log/reels-hunter/agent.log
 
-      - name: Upload screenshots & logs on failure
+      - name: Upload screenshots and logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
@@ -342,7 +357,7 @@ jobs:
 
       - name: Save history.db
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache@v4
         with:
           path: history.db
           key: reels-history-db-${{ github.run_id }}
