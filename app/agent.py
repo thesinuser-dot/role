@@ -510,16 +510,64 @@ class InstagramAgent:
         except Exception as exc:
             self.log.warning(f"Startup tab Instagram navigation failed (non-fatal): {exc}")
 
-        # Open TikTok in a new tab
+        # Open TikTok in a new tab — inject cookies BEFORE navigation
         try:
             self.log.info("Startup tab: opening TikTok...")
+
+            # ── Inject TikTok cookies before any navigation ───────────────
+            _tt_cookies_injected = 0
+            _tt_cookies_file = Config.TIKTOK_COOKIES_FILE
+            try:
+                import json as _json
+                from pathlib import Path as _Path
+
+                _tt_path = _Path(_tt_cookies_file)
+                if _tt_path.exists():
+                    # Parse Netscape cookie file into Playwright format
+                    _tt_pw_cookies = []
+                    for _line in _tt_path.read_text().splitlines():
+                        _line = _line.strip()
+                        if not _line or _line.startswith("#"):
+                            continue
+                        _parts = _line.split("\t")
+                        if len(_parts) >= 7:
+                            _domain, _subdomain, _path, _secure, _expires, _name, _value = _parts[:7]
+                            try:
+                                _exp = int(float(_expires))
+                                if _exp <= 0:
+                                    _exp = 2147483647
+                            except Exception:
+                                _exp = 2147483647
+                            if not _domain.startswith("."):
+                                _domain = "." + _domain
+                            _tt_pw_cookies.append({
+                                "name":     _name,
+                                "value":    _value,
+                                "domain":   _domain,
+                                "path":     _path or "/",
+                                "secure":   _secure.upper() == "TRUE",
+                                "httpOnly": False,
+                                "sameSite": "None",
+                                "expires":  _exp,
+                            })
+                    if _tt_pw_cookies:
+                        ctx.add_cookies(_tt_pw_cookies)
+                        _tt_cookies_injected = len(_tt_pw_cookies)
+                        self.log.info(f"TikTok: pre-injected {_tt_cookies_injected} cookies into context ✅")
+                    else:
+                        self.log.warning("TikTok: cookies file exists but parsed 0 cookies.")
+                else:
+                    self.log.warning(f"TikTok: cookies file not found at {_tt_cookies_file}")
+            except Exception as _exc:
+                self.log.warning(f"TikTok cookie pre-injection failed (non-fatal): {_exc}")
+
             tiktok_page = ctx.new_page()
             tiktok_page.goto(
                 "https://www.tiktok.com/",
                 wait_until="domcontentloaded",
                 timeout=20_000,
             )
-            self.log.info("Startup tab: TikTok opened ✅")
+            self.log.info(f"Startup tab: TikTok opened ✅ ({_tt_cookies_injected} cookies injected)")
         except Exception as exc:
             self.log.warning(f"Startup tab TikTok failed (non-fatal): {exc}")
 
