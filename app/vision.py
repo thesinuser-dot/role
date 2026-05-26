@@ -82,11 +82,10 @@ class VisionEvaluator:
         else:
             self.log.warning("Gemini API key not set — will use Gemini Web Browser (visible) as fallback.")
 
-        # Gemini Web Browser fallback — visible Chromium window when API key absent
-        self._gemini_web_browser: Optional[GeminiWebBrowser] = None
-        if not self.gemini_enabled:
-            self._gemini_web_browser = GeminiWebBrowser(Config.GEMINI_COOKIES)
-            self.log.info("GeminiWebBrowser (visible) fallback initialised.")
+        # Gemini Web Browser — always initialised so it can catch quota hits even
+        # when the API key is configured.  headless=False always.
+        self._gemini_web_browser: Optional[GeminiWebBrowser] = GeminiWebBrowser(Config.GEMINI_COOKIES)
+        self.log.info("GeminiWebBrowser (visible) ready as quota/no-key fallback.")
 
         # Will be set by agent after notifier is available
         self._notifier = None
@@ -276,19 +275,35 @@ class VisionEvaluator:
                     break
 
         # ── All attempts exhausted ────────────────────────────────────────────
-        if Config.ENABLE_GEMINI_FALLBACK and quota_exhausted:
-            if views >= Config.FALLBACK_MIN_VIEWS and likes >= Config.FALLBACK_MIN_LIKES:
-                self.log.warning(
-                    f"Gemini quota exhausted — fallback PASSED "
-                    f"(views={views:,}, likes={likes:,})"
+        # Quota / rate-limit hit → switch to visible Gemini Web browser immediately
+        if quota_exhausted and self._gemini_web_browser is not None:
+            self.log.warning(
+                "Gemini API quota/rate limit hit — switching to GeminiWebBrowser (visible)..."
+            )
+            try:
+                response_text, snap = self._gemini_web_browser.ask(
+                    self._GEMINI_PROMPT,
+                    image_bytes=compressed,
                 )
-                return True, f"Gemini fallback PASSED (views={views:,}, likes={likes:,})"
-            else:
-                self.log.warning(
-                    f"Gemini quota exhausted — fallback FAILED "
-                    f"(views={views:,}, likes={likes:,})"
-                )
-                return False, "Gemini fallback FAILED (insufficient engagement)"
+                if snap and self._notifier:
+                    try:
+                        self._notifier.send_photo(
+                            snap,
+                            caption="🌐 <b>Gemini Web Vision Check</b> (API quota hit — switched to browser)",
+                        )
+                    except Exception as se:
+                        self.log.warning(f"Could not send Gemini Web screenshot: {se}")
+                if response_text:
+                    upper = response_text.upper()
+                    if "PASSED" in upper:
+                        return True, "Gemini Web Vision: PASSED (API quota fallback)"
+                    if "FAILED" in upper:
+                        return False, "Gemini Web Vision: FAILED (API quota fallback)"
+                self.log.warning("Gemini Web returned no usable response — fail-closed")
+                return False, "Gemini Web: no usable response (fail-closed)"
+            except Exception as we:
+                self.log.error(f"GeminiWebBrowser fallback failed: {we}")
+                return False, f"Gemini Web error (fail-closed): {we}"
 
         self.log.error(
             f"Gemini failed after {Config.GEMINI_RETRIES + 1} attempt(s) "
