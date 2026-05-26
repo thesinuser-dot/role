@@ -35,10 +35,40 @@ class Config:
         if p.strip()
     ]
     GROQ_API_KEY: str = os.environ.get("GROQ_API_KEY", "")
-    GROQ_MODEL: str = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+    # Auto-cascade through best free Groq/LLaMA models — fastest available wins.
+    # Override with GROQ_MODEL env var if you want a specific model.
+    GROQ_MODEL: str = os.environ.get("GROQ_MODEL", "auto")
+    # Ordered list of best free Groq models (tried in order, first success wins).
+    GROQ_MODEL_CASCADE: List[str] = [
+        m.strip()
+        for m in os.environ.get(
+            "GROQ_MODEL_CASCADE",
+            "llama-3.3-70b-versatile,"
+            "llama-3.1-70b-versatile,"
+            "llama3-70b-8192,"
+            "llama-3.1-8b-instant,"
+            "llama3-8b-8192,"
+            "gemma2-9b-it",
+        ).split(",")
+        if m.strip()
+    ]
     OPENROUTER_API_KEY: str = os.environ.get("OPENROUTER_API_KEY", "")
-    # OpenRouter's free router automatically picks a currently available free model.
-    OPENROUTER_MODEL: str = os.environ.get("OPENROUTER_MODEL", "openrouter/free")
+    # "auto" = use OpenRouter's free model router (always picks something available).
+    # Override with OPENROUTER_MODEL env var for a specific model.
+    OPENROUTER_MODEL: str = os.environ.get("OPENROUTER_MODEL", "auto")
+    # Best free OpenRouter models tried in order (fallback cascade).
+    OPENROUTER_MODEL_CASCADE: List[str] = [
+        m.strip()
+        for m in os.environ.get(
+            "OPENROUTER_MODEL_CASCADE",
+            "meta-llama/llama-3.3-70b-instruct:free,"
+            "meta-llama/llama-3.1-8b-instruct:free,"
+            "mistralai/mistral-7b-instruct:free,"
+            "google/gemma-2-9b-it:free,"
+            "qwen/qwen2.5-72b-instruct:free",
+        ).split(",")
+        if m.strip()
+    ]
     OPENROUTER_APP_NAME: str = os.environ.get("OPENROUTER_APP_NAME", "Reels Hunter")
     
     # ── Gemini Fallback Mode (when API quota/limit is hit) ────────────────────
