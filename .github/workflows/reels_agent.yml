@@ -1,0 +1,348 @@
+name: Reels AI Hunter 🎬
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"
+  workflow_dispatch:
+    inputs:
+      pause_for_desktop:
+        description: "Pause before agent so you can open the desktop first (yes/no)"
+        required: false
+        default: "yes"
+      min_views:
+        description: "Minimum view count"
+        required: false
+        default: "50000"
+      max_reels:
+        description: "Max reels to send"
+        required: false
+        default: "5"
+
+env:
+  MIN_VIEWS:               ${{ github.event.inputs.min_views  || '50000' }}
+  MAX_QUALIFIED_SEND:      ${{ github.event.inputs.max_reels  || '5' }}
+  TARGET_REELS_SCAN:       35
+  MAX_RUNTIME_SECONDS:     2400
+  SHUTDOWN_BUFFER_SECONDS: 60
+  PLAYWRIGHT_HEADLESS:     "false"
+  GEMINI_MODEL:            "gemini-2.0-flash"
+  GEMINI_MAX_DIM:          720
+  TELEGRAM_MAX_VIDEO_MB:   49
+  DB_PATH:                 history.db
+  DOWNLOAD_DIR:            /tmp/reels_downloads
+  SCREENSHOT_DIR:          /tmp/reels_screenshots
+  USE_PROXY:               "false"
+  DISPLAY:                 ":99"
+  WEB_PORT:                "8080"
+  VIEWPORT_W:              "720"
+  VIEWPORT_H:              "1280"
+  PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: /usr/bin/chromium-browser
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Restore history.db cache
+        uses: actions/cache@v4
+        with:
+          path: history.db
+          key: reels-history-db-${{ github.run_id }}
+          restore-keys: |
+            reels-history-db-
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update -qq
+          UBUNTU_VER=$(lsb_release -rs | cut -d. -f1)
+          if [[ "$UBUNTU_VER" -ge 24 ]]; then
+            ASOUND_PKG="libasound2t64"
+          else
+            ASOUND_PKG="libasound2"
+          fi
+
+          sudo apt-get install -y --no-install-recommends \
+            xvfb x11vnc novnc websockify \
+            fluxbox xterm dbus-x11 x11-xserver-utils x11-utils \
+            ffmpeg \
+            fonts-liberation fonts-noto fonts-noto-color-emoji \
+            fonts-dejavu-core fonts-open-sans \
+            fontconfig \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+            libdbus-1-3 libxcomposite1 libxdamage1 libxext6 libxfixes3 \
+            libxrandr2 libgbm1 libxkbcommon0 libpango-1.0-0 \
+            libpangocairo-1.0-0 libcairo2 "$ASOUND_PKG" libgtk-3-0 \
+            libglib2.0-0 libx11-6 libx11-xcb1 libxcb1 libxss1 libxtst6 \
+            procps curl wget ca-certificates lsb-release \
+            xdotool
+          sudo fc-cache -fv
+
+      - name: Install Chromium with H.264/AAC codecs
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            chromium-browser \
+            chromium-codecs-ffmpeg-extra
+          # Verify codec build has H.264
+          chromium-browser --version
+
+      - name: Start virtual desktop (noVNC)
+        run: |
+          # Virtual display
+          Xvfb "$DISPLAY" -screen 0 1440x2560x24 -ac &
+          sleep 2
+
+          # Window manager
+          DISPLAY="$DISPLAY" fluxbox > /tmp/fluxbox.log 2>&1 &
+          sleep 1
+
+          # VNC server on localhost:5900 (no password)
+          x11vnc -display "$DISPLAY" -nopw -listen localhost \
+            -xkb -forever -shared -quiet > /tmp/x11vnc.log 2>&1 &
+          sleep 2
+
+          # noVNC web client on WEB_PORT → forwards to VNC
+          websockify --web /usr/share/novnc/ \
+            --wrap-mode=ignore \
+            ${WEB_PORT} localhost:5900 > /tmp/novnc.log 2>&1 &
+          sleep 2
+
+          echo "✅  noVNC ready — http://localhost:${WEB_PORT}/vnc.html?autoconnect=true"
+
+      - name: Start Ngrok tunnel & notify Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          NGROK_AUTHTOKEN:    ${{ secrets.NGROK_AUTHTOKEN }}
+        run: |
+          curl -sSL https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz \
+            | sudo tar -xz -C /usr/local/bin
+          ngrok config add-authtoken "$NGROK_AUTHTOKEN"
+          ngrok http ${WEB_PORT} --log=stdout --log-format=json \
+            --request-header-add "ngrok-skip-browser-warning:true" > /tmp/ngrok.log 2>&1 &
+
+          cat > /tmp/ngrok_notify.py << 'PYEOF'
+          import time, json, os, urllib.request, sys
+
+          TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
+          CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+
+          url = None
+          for _ in range(30):
+              try:
+                  with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels", timeout=3) as r:
+                      d = json.load(r)
+                      t = d.get("tunnels", [])
+                      if t:
+                          url = t[0]["public_url"]
+                          break
+              except Exception:
+                  pass
+              time.sleep(1)
+
+          if not url:
+              print("ERROR: Ngrok tunnel not found")
+              sys.exit(1)
+
+          print(f"Tunnel ready: {url}")
+          with open("/tmp/ngrok_url", "w") as f:
+              f.write(url)
+
+          text = (
+              "🖥️ Desktop Ready — open in your browser:\n\n"
+              f"{url}/vnc.html?autoconnect=true\n\n"
+              "No app needed — just click the link above.\n\n"
+              "Commands:\n"
+              "/resume    — start the Reels agent\n"
+              "/newlink   — get a fresh tunnel URL\n"
+              "/desktop   — open a terminal on screen\n"
+          )
+
+          data = json.dumps({"chat_id": CHAT_ID, "text": text}).encode()
+          req = urllib.request.Request(
+              f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+              data=data, headers={"Content-Type": "application/json"}
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=10) as r:
+                  result = json.load(r)
+                  print("Telegram OK" if result.get("ok") else f"Telegram error: {result}")
+          except Exception as e:
+              print(f"Telegram send failed: {e}")
+          PYEOF
+          python3 /tmp/ngrok_notify.py
+
+      - name: "Wait for Telegram commands"
+        if: ${{ github.event.inputs.pause_for_desktop == 'yes' }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          NGROK_AUTHTOKEN:    ${{ secrets.NGROK_AUTHTOKEN }}
+          INSTAGRAM_SESSION_COOKIES: ${{ secrets.INSTAGRAM_SESSION_COOKIES }}
+          GEMINI_API_KEY:            ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          cat > /tmp/desktop_poller.py << 'PYEOF'
+          import os, json, time, subprocess, urllib.request, sys
+
+          TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
+          CHAT_ID = str(os.environ["TELEGRAM_CHAT_ID"]).strip()
+          DISPLAY = os.environ.get("DISPLAY", ":99")
+          WEB_PORT = os.environ.get("WEB_PORT", "8080")
+
+          def tg_get(method, params=None):
+              qs = "&".join(f"{k}={v}" for k, v in (params or {}).items())
+              try:
+                  with urllib.request.urlopen(
+                      f"https://api.telegram.org/bot{TOKEN}/{method}?{qs}", timeout=15
+                  ) as r:
+                      return json.load(r)
+              except Exception as e:
+                  print(f"[tg_get error] {e}")
+                  return {}
+
+          def tg_send(text):
+              data = json.dumps({"chat_id": CHAT_ID, "text": text}).encode()
+              req = urllib.request.Request(
+                  f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                  data=data, headers={"Content-Type": "application/json"}
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=10) as r:
+                      return json.load(r)
+              except Exception as e:
+                  print(f"[tg_send error] {e}")
+
+          def get_ngrok_url():
+              try:
+                  with open("/tmp/ngrok_url") as f:
+                      return f.read().strip()
+              except Exception:
+                  pass
+              try:
+                  with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels", timeout=3) as r:
+                      d = json.load(r)
+                      t = d.get("tunnels", [])
+                      if t:
+                          return t[0]["public_url"]
+              except Exception:
+                  pass
+              return None
+
+          def restart_ngrok():
+              subprocess.run(["pkill", "ngrok"], capture_output=True)
+              time.sleep(2)
+              subprocess.Popen(
+                  ["ngrok", "http", WEB_PORT, "--log=stdout", "--log-format=json",
+                   "--request-header-add", "ngrok-skip-browser-warning:true"],
+                  stdout=open("/tmp/ngrok.log", "w"), stderr=subprocess.STDOUT
+              )
+              time.sleep(5)
+              url = get_ngrok_url()
+              if url:
+                  with open("/tmp/ngrok_url", "w") as f:
+                      f.write(url)
+                  tg_send(
+                      f"🔄 New desktop link:\n\n{url}/vnc.html?autoconnect=true\n\n"
+                      "/resume /newlink /desktop"
+                  )
+              else:
+                  tg_send("❌ Failed to restart Ngrok.")
+
+          def cmd_desktop():
+              env = os.environ.copy()
+              env["DISPLAY"] = DISPLAY
+              subprocess.Popen(
+                  ["xterm", "-fa", "Monospace", "-fs", "12"],
+                  env=env,
+                  stdout=open("/tmp/terminal.log", "w"),
+                  stderr=subprocess.STDOUT,
+              )
+              tg_send(f"✅ Terminal opened on display {DISPLAY}")
+
+          # ── Main command poll loop ────────────────────────────────────────
+          resp    = tg_get("getUpdates", {"limit": "1", "offset": "-1"})
+          results = resp.get("result", [])
+          offset  = (results[-1]["update_id"] + 1) if results else 0
+          print(f"Polling from offset {offset}.")
+
+          for i in range(660):
+              resp    = tg_get("getUpdates", {"offset": str(offset), "limit": "10", "timeout": "4"})
+              updates = resp.get("result", [])
+
+              for upd in updates:
+                  offset = upd["update_id"] + 1
+                  msg    = upd.get("message", {})
+                  text   = msg.get("text", "").strip()
+                  cid    = str(msg.get("chat", {}).get("id", "")).strip()
+                  if cid != CHAT_ID:
+                      continue
+                  print(f"  [cmd] {text!r}")
+
+                  if text.startswith("/resume"):
+                      tg_send("▶️ Resuming agent...")
+                      sys.exit(0)
+                  elif text.startswith("/newlink"):
+                      tg_send("🔄 Restarting tunnel...")
+                      restart_ngrok()
+                  elif text.startswith("/desktop"):
+                      cmd_desktop()
+
+              time.sleep(5)
+
+          print("55-min timeout — continuing.")
+          PYEOF
+          python3 /tmp/desktop_poller.py
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright browsers
+        run: |
+          playwright install chromium
+          sudo apt-get install -y --no-install-recommends \
+            libwoff1 libopus0 libwebp7 libwebpdemux2 libenchant-2-2 \
+            libgudev-1.0-0 libsecret-1-0 libhyphen0 libmanette-0.2-0 \
+            libgles2 libgstreamer-gl1.0-0 libgstreamer-plugins-bad1.0-0 \
+            gstreamer1.0-plugins-bad libasound2t64 2>/dev/null || true
+
+      - name: Create runtime directories
+        run: |
+          mkdir -p /tmp/reels_downloads /tmp/reels_screenshots
+          sudo mkdir -p /var/log/reels-hunter
+          sudo chmod 777 /var/log/reels-hunter
+
+      - name: Run Reels AI Hunter agent
+        env:
+          INSTAGRAM_SESSION_COOKIES: ${{ secrets.INSTAGRAM_SESSION_COOKIES }}
+          GEMINI_API_KEY:            ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN:        ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:          ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          echo "DISPLAY=$DISPLAY"
+          python3 app/agent.py 2>&1 | tee /var/log/reels-hunter/agent.log
+
+      - name: Upload screenshots & logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reels-debug-${{ github.run_id }}
+          path: |
+            /tmp/reels_screenshots/
+            /var/log/reels-hunter/
+          retention-days: 7
+
+      - name: Save history.db
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: history.db
+          key: reels-history-db-${{ github.run_id }}
