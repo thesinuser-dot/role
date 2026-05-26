@@ -1191,5 +1191,3 @@ if __name__ == "__main__":
     log.info("=" * 70)
     agent = InstagramAgent()
     agent.run()
-PYEOF
-echo "agent.py written"
