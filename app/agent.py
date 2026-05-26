@@ -526,6 +526,7 @@ class InstagramAgent:
         run_stats: RunStats,
         force: bool = False,
         skip_vision: bool = False,
+        collect_ai_tags: bool = False,
     ) -> None:
         """
         Drive one ReelTask through the full pipeline.
@@ -584,6 +585,7 @@ class InstagramAgent:
 
         views = metrics["views"]
         likes = metrics["likes"]
+        caption = metrics.get("caption", "")
         task.views = views
         task.likes = likes
 
@@ -620,8 +622,9 @@ class InstagramAgent:
             self.log.info(f"[{reel_id}] Caption OK: {cap_reason}")
 
         # ── 5. Vision ─────────────────────────────────────────────────────────
+        screenshot: Optional[bytes] = None
+        suggested_tags: List[str] = []
         if not skip_vision:
-            screenshot: Optional[bytes] = None
             try:
                 screenshot = _capture_reel_screenshot(page, reel_id)
             except PlaywrightError as exc:
@@ -655,6 +658,23 @@ class InstagramAgent:
                 return
 
             self.log.info(f"[{reel_id}] Vision passed: {vision_reason}")
+
+            if collect_ai_tags and screenshot:
+                try:
+                    suggested_tags = self.vision.suggest_hashtags(
+                        screenshot,
+                        views=views,
+                        likes=likes,
+                        caption=caption,
+                    )
+                    if suggested_tags:
+                        self._poller.reply(
+                            "🏷️ <b>AI hashtag ideas</b>\n<code>"
+                            + " ".join(suggested_tags)
+                            + "</code>"
+                        )
+                except Exception as exc:
+                    self.log.warning(f"[{reel_id}] Hashtag generation failed: {exc}")
         else:
             self.log.info(f"[{reel_id}] Vision SKIPPED (test mode)")
 
@@ -711,7 +731,7 @@ class InstagramAgent:
             # ── 9. TikTok post (non-blocking — failure never marks task failed) ─
             if self.tiktok.enabled and video_path.exists():
                 self.log.info(f"[{reel_id}] Posting to TikTok...")
-                tiktok_ok = self.tiktok.post(video_path, reel_url, views, likes)
+                tiktok_ok = self.tiktok.post(video_path, reel_url, views, likes, extra_tags=suggested_tags)
                 if tiktok_ok:
                     self.log.info(f"[{reel_id}] ✅ TikTok post succeeded.")
                 else:
@@ -744,8 +764,7 @@ class InstagramAgent:
             not delayed until the hunt finishes.
           • From the main event loop as usual.
 
-        When defer_hunt_cmds=True (inside a running hunt), __hunt__ and
-        __test__ are put back on the queue rather than executed inline, so
+        When defer_hunt_cmds=True (inside a running hunt), __hunt__, __test__ and __testsetup__ are put back on the queue rather than executed inline, so
         they run after the current hunt completes.
         """
         deferred: List[Dict] = []
@@ -756,7 +775,7 @@ class InstagramAgent:
                 break
 
             cmd = item["cmd"]
-            if defer_hunt_cmds and cmd in ("__hunt__", "__test__"):
+            if defer_hunt_cmds and cmd in ("__hunt__", "__test__", "__testsetup__"):
                 deferred.append(item)
                 continue
 
@@ -918,6 +937,35 @@ class InstagramAgent:
             self.log.error(f"Test reel exception:\n{tb}")
             self._poller.reply(f"❌ Test crashed:\n<pre>{tb[:400]}</pre>")
 
+    def _run_testsetup(self, url: str) -> None:
+        self.log.info(f"TESTSETUP MODE: {url}")
+        self._poller.reply(
+            f"🧪 <b>Test setup queued</b> — running AI → download → Telegram → TikTok...\n"
+            f"<code>{url}</code>"
+        )
+        reel_id = ReelCollector.extract_reel_id(url)
+        if not reel_id:
+            self._poller.reply("❌ Cannot parse reel ID from that URL.")
+            return
+
+        task = ReelTask(url=url, reel_id=reel_id, max_attempts=1)
+        dummy_stats = RunStats()
+        try:
+            self._process_task(
+                task,
+                dummy_stats,
+                force=True,
+                skip_vision=False,
+                collect_ai_tags=True,
+            )
+            self._poller.reply(f"✅ Test setup complete — status: <b>{task.status.value}</b>")
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            tb = traceback.format_exc()
+            self.log.error(f"Test setup exception:\n{tb}")
+            self._poller.reply(f"❌ Test setup crashed:\n<pre>{tb[:400]}</pre>")
+
     # ── Command dispatch ──────────────────────────────────────────────────────
 
     def _get_status_text(self) -> str:
@@ -988,6 +1036,22 @@ class InstagramAgent:
                 reply("⚠️ A hunt is running. /test will run after it finishes.")
             reply(f"🧪 Test queued:\n<code>{url}</code>")
             self._cmd_queue.put({"cmd": "__test__", "arg": url})
+
+        elif cmd == "/testsetup":
+            url = arg.strip()
+            if not url:
+                reply("❌ Usage: <code>/testsetup https://www.instagram.com/reel/XXXXX/</code>")
+                return
+            if "/reel" not in url and "/p/" not in url:
+                reply(
+                    "❌ URL doesn't look like an Instagram reel.\n"
+                    "Accepted: <code>/reel/XXXXX/</code>  or  <code>/p/XXXXX/</code>"
+                )
+                return
+            if self._hunting:
+                reply("⚠️ A hunt is running. /testsetup will run after it finishes.")
+            reply(f"🧪 Test setup queued:\n<code>{url}</code>")
+            self._cmd_queue.put({"cmd": "__testsetup__", "arg": url})
 
         elif cmd == "/setviews":
             try:
@@ -1165,6 +1229,16 @@ class InstagramAgent:
                         self.log.error(f"Test exception:\n{tb}")
                         self._poller.reply(f"❌ Test crashed:\n<pre>{tb[:400]}</pre>")
 
+                elif cmd == "__testsetup__":
+                    try:
+                        self._run_testsetup(arg)
+                    except KeyboardInterrupt:
+                        raise
+                    except Exception:
+                        tb = traceback.format_exc()
+                        self.log.error(f"Test setup exception:\n{tb}")
+                        self._poller.reply(f"❌ Test setup crashed:\n<pre>{tb[:400]}</pre>")
+
                 else:
                     try:
                         self._dispatch_command(cmd, arg)
@@ -1224,6 +1298,11 @@ class InstagramAgent:
                 )
         except Exception as exc:
             self.log.warning(f"Could not finalise run record: {exc}")
+
+        try:
+            self.tiktok.close()
+        except Exception as exc:
+            self.log.warning(f"Could not close TikTok poster cleanly: {exc}")
 
         self.db.close()
         self.log.info(
