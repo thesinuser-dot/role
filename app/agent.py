@@ -44,6 +44,7 @@ from notifier import NotificationService
 from downloader import download_reel
 from pipeline import WorkQueue, ReelTask, ReelStatus, FailureKind
 from tiktok_poster import TikTokPoster
+from b2_uploader import B2Uploader
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -315,6 +316,7 @@ class InstagramAgent:
         self.vision   = VisionEvaluator(Config.GEMINI_API_KEY)
         self.notifier = NotificationService(Config.TELEGRAM_BOT_TOKEN, Config.TELEGRAM_CHAT_ID)
         self.tiktok   = TikTokPoster()
+        self.b2       = B2Uploader()
         self.wq       = WorkQueue()
 
         # Give vision access to the notifier so Gemini Web screenshots go to Telegram
@@ -568,6 +570,10 @@ class InstagramAgent:
         if getattr(self.vision, '_gemini_web_browser', None):
             self.vision._gemini_web_browser.set_context(ctx)
             self.log.info("GeminiWebBrowser: shared browser context injected ✅")
+            # Pass the existing Gemini page so it never opens a new tab
+            if self._gemini_page is not None:
+                self.vision._gemini_web_browser.set_page(self._gemini_page)
+                self.log.info("GeminiWebBrowser: existing Gemini page injected ✅")
 
         self.log.info("✅ All startup tabs opened: Instagram | TikTok | Gemini")
 
@@ -599,6 +605,9 @@ class InstagramAgent:
             return False
 
         self.collector = ReelCollector(self.bm)
+
+        # ── Telegram connectivity check ────────────────────────────────────────
+        self.notifier.test_connection()
 
         # ── Open Instagram, TikTok, and Gemini tabs instantly on startup ──────
         self._open_startup_tabs()
@@ -828,7 +837,20 @@ class InstagramAgent:
             self.log.info(f"[{reel_id}] Delivered to Telegram (strategy={strategy})")
             self.db.mark_processed(reel_id, reel_url, "downloaded", views, likes)
 
-            # ── 9. TikTok post (non-blocking — failure never marks task failed) ─
+            # ── 9. B2 upload (non-blocking — persists video beyond this run) ──
+            if video_path.exists():
+                b2_url = self.b2.upload(video_path, reel_id, views, likes)
+                if b2_url:
+                    self.log.info(f"[{reel_id}] ✅ B2 upload succeeded: {b2_url}")
+                    # Send the B2 link to Telegram so you can access it later
+                    try:
+                        self.notifier.send_message(
+                            f"☁️ <b>B2 saved:</b> <a href='{b2_url}'>{reel_id}</a>"
+                        )
+                    except Exception:
+                        pass
+
+            # ── 10. TikTok post (non-blocking — failure never marks task failed) ─
             if self.tiktok.enabled and video_path.exists():
                 self.log.info(f"[{reel_id}] Posting to TikTok...")
                 tiktok_ok = self.tiktok.post(video_path, reel_url, views, likes, extra_tags=suggested_tags)
