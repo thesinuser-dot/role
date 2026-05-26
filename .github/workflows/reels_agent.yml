@@ -35,7 +35,6 @@ env:
   DB_PATH:                 history.db
   DOWNLOAD_DIR:            /tmp/reels_downloads
   SCREENSHOT_DIR:          /tmp/reels_screenshots
-  USE_PROXY:               "false"
   DISPLAY:                 ":99"
   WEB_PORT:                "8080"
   VIEWPORT_W:              "720"
@@ -322,9 +321,10 @@ jobs:
         env:
           TIKTOK_COOKIES: ${{ secrets.TIKTOK_COOKIES }}
         run: |
-          mkdir -p /run/secrets
+          mkdir -p "$HOME/.secrets"
           if [ -n "$TIKTOK_COOKIES" ]; then
-            echo "$TIKTOK_COOKIES" | base64 -d > /run/secrets/tiktok_cookies.txt
+            echo "$TIKTOK_COOKIES" | base64 -d > "$HOME/.secrets/tiktok_cookies.txt"
+            chmod 600 "$HOME/.secrets/tiktok_cookies.txt"
             echo "TikTok cookies written."
           else
             echo "TIKTOK_COOKIES secret not set -- TikTok posting will be skipped."
@@ -337,7 +337,7 @@ jobs:
           TELEGRAM_BOT_TOKEN:        ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:          ${{ secrets.TELEGRAM_CHAT_ID }}
           TIKTOK_SESSION_COOKIES:    ${{ secrets.TIKTOK_SESSION_COOKIES }}
-          TIKTOK_COOKIES_FILE:       /run/secrets/tiktok_cookies.txt
+          TIKTOK_COOKIES_FILE:       $HOME/.secrets/tiktok_cookies.txt
         run: |
           echo "DISPLAY=$DISPLAY"
           python3 app/agent.py 2>&1 | tee /var/log/reels-hunter/agent.log
