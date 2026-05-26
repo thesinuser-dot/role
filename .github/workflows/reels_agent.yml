@@ -83,7 +83,8 @@ jobs:
             libpangocairo-1.0-0 libcairo2 "$ASOUND_PKG" libgtk-3-0 \
             libglib2.0-0 libx11-6 libx11-xcb1 libxcb1 libxss1 libxtst6 \
             procps curl wget ca-certificates lsb-release \
-            xdotool
+            xdotool \
+            xclip
           sudo fc-cache -fv
 
       - name: Install Chromium with H.264/AAC codecs
@@ -361,7 +362,6 @@ jobs:
           TIKTOK_COOKIES_FILE:       /home/runner/.secrets/tiktok_cookies.txt
           TIKTOK_EMAIL:              ${{ secrets.TIKTOK_EMAIL }}
           TIKTOK_PASSWORD:           ${{ secrets.TIKTOK_PASSWORD }}
-          GH_PAT:                    ${{ secrets.GH_PAT }}
           B2_APPLICATION_KEY_ID:     ${{ secrets.B2_APPLICATION_KEY_ID }}
           B2_APPLICATION_KEY:        ${{ secrets.B2_APPLICATION_KEY }}
           B2_BUCKET_NAME:            ${{ secrets.B2_BUCKET_NAME }}
