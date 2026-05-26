@@ -26,6 +26,24 @@ class Config:
     # How many times to retry a transient Gemini error before failing closed
     GEMINI_RETRIES: int = int(os.environ.get("GEMINI_RETRIES", "2"))
 
+    # ── Gemini Web fallback (browser-based, no API key needed) ────────────────
+    # Paste Google account cookies (JSON array or semicolon-separated) so the
+    # agent can query gemini.google.com directly when the API key is absent or
+    # quota-exhausted.
+    GEMINI_COOKIES: str = os.environ.get("GEMINI_COOKIES", "")
+    # Enable Gemini Web as a vision provider when API key is unavailable
+    GEMINI_WEB_ENABLED: bool = os.environ.get("GEMINI_WEB_ENABLED", "true").strip().lower() == "true"
+
+    # ── Human approval (Telegram inline buttons) ──────────────────────────────
+    # When True, each reel that passes AI vision is sent as a screenshot to
+    # Telegram with ✅ Approve and ⏭ Skip buttons before downloading.
+    # When False (default), reels are downloaded and sent automatically.
+    HUMAN_APPROVAL_ENABLED: bool = os.environ.get("HUMAN_APPROVAL_ENABLED", "false").strip().lower() == "true"
+    # Seconds to wait for a human response before auto-approving or auto-skipping
+    HUMAN_APPROVAL_TIMEOUT_S: int = int(os.environ.get("HUMAN_APPROVAL_TIMEOUT_S", "120"))
+    # What to do when the timeout expires with no response: "approve" or "skip"
+    HUMAN_APPROVAL_TIMEOUT_ACTION: str = os.environ.get("HUMAN_APPROVAL_TIMEOUT_ACTION", "approve").strip().lower()
+
     # ── Text / hashtag providers ───────────────────────────────────────────────
     # Provider order is automatic by default: first configured provider wins.
     AI_PROVIDER_ORDER: List[str] = [
@@ -224,6 +242,8 @@ class Config:
             f"|  DB path            : {cls.DB_PATH}",
             f"|  Gemini model       : {cls.GEMINI_MODEL}",
             f"|  Gemini enabled     : {bool(cls.GEMINI_API_KEY)}",
+            f"|  Gemini Web enabled : {cls.GEMINI_WEB_ENABLED and bool(cls.GEMINI_COOKIES)}",
+            f"|  Human approval     : {cls.HUMAN_APPROVAL_ENABLED}",
             f"|  Groq model         : {cls.GROQ_MODEL}",
             f"|  Groq enabled       : {bool(cls.GROQ_API_KEY)}",
             f"|  OpenRouter model   : {cls.OPENROUTER_MODEL}",
