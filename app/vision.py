@@ -23,6 +23,7 @@ import google.generativeai as genai
 
 from ai_router import AIProviderRouter, parse_hashtags
 from config import Config
+from gemini_web_browser import GeminiWebBrowser
 
 
 class VisionEvaluator:
@@ -79,7 +80,16 @@ class VisionEvaluator:
         if self.gemini_enabled:
             self.log.info(f"Gemini Vision ready — model={Config.GEMINI_MODEL}")
         else:
-            self.log.warning("Gemini not available — Stage 2 vision disabled.")
+            self.log.warning("Gemini API key not set — will use Gemini Web Browser (visible) as fallback.")
+
+        # Gemini Web Browser fallback — visible Chromium window when API key absent
+        self._gemini_web_browser: Optional[GeminiWebBrowser] = None
+        if not self.gemini_enabled:
+            self._gemini_web_browser = GeminiWebBrowser(Config.GEMINI_COOKIES)
+            self.log.info("GeminiWebBrowser (visible) fallback initialised.")
+
+        # Will be set by agent after notifier is available
+        self._notifier = None
 
     # ── Stage 1: local Pillow pixel analysis ──────────────────────────────────
 
@@ -183,7 +193,34 @@ class VisionEvaluator:
         return None
 
     def check_with_gemini(self, screenshot_bytes: bytes, views: int = 0, likes: int = 0) -> Tuple[bool, str]:
+        # ── Gemini Web Browser fallback (no API key) ──────────────────────────
         if not self.gemini_enabled:
+            if self._gemini_web_browser is not None:
+                self.log.info("No Gemini API key — using GeminiWebBrowser (visible browser)...")
+                try:
+                    response_text, snap = self._gemini_web_browser.ask(
+                        self._GEMINI_PROMPT,
+                        image_bytes=self._compress_for_gemini(screenshot_bytes),
+                    )
+                    if snap and self._notifier:
+                        try:
+                            self._notifier.send_photo(
+                                snap,
+                                caption="🌐 <b>Gemini Web Vision Check</b> — screenshot of AI response",
+                            )
+                        except Exception as exc:
+                            self.log.warning(f"Could not send Gemini Web screenshot: {exc}")
+                    if response_text:
+                        upper = response_text.upper()
+                        if "PASSED" in upper:
+                            return True, "Gemini Web Vision: PASSED"
+                        if "FAILED" in upper:
+                            return False, "Gemini Web Vision: FAILED"
+                    self.log.warning("Gemini Web returned no usable response — fail-closed")
+                    return False, "Gemini Web: no usable response (fail-closed)"
+                except Exception as exc:
+                    self.log.error(f"GeminiWebBrowser check failed: {exc}")
+                    return False, f"Gemini Web error (fail-closed): {exc}"
             return True, "Gemini disabled (no API key) — skipped"
 
         compressed = self._compress_for_gemini(screenshot_bytes)
