@@ -148,6 +148,44 @@ class VisionEvaluator:
         msg = str(exc).lower()
         return any(tok in msg for tok in self._RETRYABLE_MESSAGES)
 
+    def _get_response_text(self, response) -> Optional[str]:
+        """
+        Safely extract text from a Gemini response.
+
+        response.text raises ValueError when the response is blocked by safety
+        filters or has no text parts — this catches that and falls back to
+        manually reading the candidates so we can log the actual block reason.
+        """
+        try:
+            text = response.text
+            if text:
+                return text.strip()
+        except ValueError:
+            pass  # blocked or empty — try candidates manually
+
+        try:
+            for candidate in response.candidates or []:
+                # Log finish reason so it shows up in the run log
+                finish = getattr(candidate, "finish_reason", None)
+                if finish and str(finish) not in ("1", "STOP"):
+                    self.log.warning(f"Gemini candidate finish_reason={finish}")
+                for part in getattr(candidate.content, "parts", []) or []:
+                    t = getattr(part, "text", None)
+                    if t and t.strip():
+                        return t.strip()
+        except Exception as exc:
+            self.log.debug(f"Candidate text extraction error: {exc}")
+
+        # Log prompt_feedback if available (explains safety blocks)
+        try:
+            fb = response.prompt_feedback
+            if fb:
+                self.log.warning(f"Gemini prompt_feedback: {fb}")
+        except Exception:
+            pass
+
+        return None
+
     def check_with_gemini(self, screenshot_bytes: bytes, views: int = 0, likes: int = 0) -> Tuple[bool, str]:
         if not self.gemini_enabled:
             return True, "Gemini disabled (no API key) — skipped"
@@ -158,69 +196,109 @@ class VisionEvaluator:
 
         for attempt in range(1, Config.GEMINI_RETRIES + 2):  # +2 = first try + N retries
             try:
-                # تجهيز هيكل البيانات الخاص بالصورة ليتناسب مع الـ SDK المستقر
                 image_part = {"mime_type": "image/jpeg", "data": compressed}
-                
+
                 response = self._model.generate_content(
                     contents=[self._GEMINI_PROMPT, image_part],
                     generation_config=genai.types.GenerationConfig(
-                        temperature=0.0, max_output_tokens=8
+                        temperature=0.0,
+                        max_output_tokens=32,   # was 8 — too tight, model needs room
                     ),
-                    request_options={"timeout": 20},
+                    request_options={"timeout": 45},  # was 20 — too short for cold starts
                 )
-                raw_text = (response.text or "").strip().upper()
-                self.log.info(f"Gemini raw response (attempt {attempt}): '{raw_text}'")
-                if "PASSED" in raw_text:
+
+                raw_text = self._get_response_text(response)
+                self.log.info(f"Gemini raw response (attempt {attempt}): {raw_text!r}")
+
+                if raw_text is None:
+                    # Blocked or empty — not a network error, don't retry
+                    self.log.warning("Gemini returned empty/blocked response — treating as FAILED")
+                    return False, "Gemini blocked/empty response (FAILED)"
+
+                upper = raw_text.upper()
+                if "PASSED" in upper:
                     return True, "Gemini Vision: PASSED"
-                if "FAILED" in raw_text:
+                if "FAILED" in upper:
                     return False, "Gemini Vision: FAILED"
-                
-                # Ambiguous response — treat as FAILED, no retry needed
-                self.log.warning(f"Ambiguous Gemini response: '{raw_text}' — treating as FAILED")
-                return False, f"Gemini ambiguous response: '{raw_text}'"
+
+                # Ambiguous — log and fail, don't retry
+                self.log.warning(f"Ambiguous Gemini response: {raw_text!r} — treating as FAILED")
+                return False, f"Gemini ambiguous response: {raw_text!r}"
 
             except Exception as exc:
                 last_exc = exc
                 exc_str = str(exc).lower()
-                
-                # Check if this is a quota/rate limit error
+
                 if any(tok in exc_str for tok in ["quota", "resource_exhausted", "rate"]):
                     quota_exhausted = True
-                    self.log.warning(f"Gemini quota/rate limit detected: {exc}")
-                
+                    self.log.warning(f"Gemini quota/rate limit (attempt {attempt}): {exc}")
+                else:
+                    self.log.warning(f"Gemini error (attempt {attempt}): {type(exc).__name__}: {exc}")
+
                 if self._is_retryable(exc) and attempt <= Config.GEMINI_RETRIES:
                     wait = 2 ** attempt
-                    self.log.warning(
-                        f"Gemini transient error (attempt {attempt}/{Config.GEMINI_RETRIES + 1}): "
-                        f"{exc} — retrying in {wait}s"
-                    )
+                    self.log.warning(f"Retrying in {wait}s...")
                     time.sleep(wait)
                 else:
                     break
 
-        # All attempts exhausted — check if fallback mode is enabled
+        # ── All attempts exhausted ────────────────────────────────────────────
         if Config.ENABLE_GEMINI_FALLBACK and quota_exhausted:
-            # Fallback to views/likes metrics
             if views >= Config.FALLBACK_MIN_VIEWS and likes >= Config.FALLBACK_MIN_LIKES:
                 self.log.warning(
-                    f"Gemini quota exhausted BUT fallback mode enabled: "
-                    f"views={views:,} >= {Config.FALLBACK_MIN_VIEWS:,} AND "
-                    f"likes={likes:,} >= {Config.FALLBACK_MIN_LIKES:,} → PASS"
+                    f"Gemini quota exhausted — fallback PASSED "
+                    f"(views={views:,}, likes={likes:,})"
                 )
                 return True, f"Gemini fallback PASSED (views={views:,}, likes={likes:,})"
             else:
                 self.log.warning(
-                    f"Gemini quota exhausted AND fallback metrics insufficient: "
-                    f"views={views:,} < {Config.FALLBACK_MIN_VIEWS:,} OR "
-                    f"likes={likes:,} < {Config.FALLBACK_MIN_LIKES:,} → FAIL"
+                    f"Gemini quota exhausted — fallback FAILED "
+                    f"(views={views:,}, likes={likes:,})"
                 )
-                return False, f"Gemini fallback FAILED (insufficient engagement)"
-        
-        # Fail closed if fallback is disabled or not a quota issue
+                return False, "Gemini fallback FAILED (insufficient engagement)"
+
         self.log.error(
-            f"Gemini failed after {Config.GEMINI_RETRIES + 1} attempt(s) (fail-closed): {last_exc}"
+            f"Gemini failed after {Config.GEMINI_RETRIES + 1} attempt(s) "
+            f"(fail-closed): {type(last_exc).__name__}: {last_exc}"
         )
         return False, f"Gemini API error (fail-closed): {last_exc}"
+
+    # ── Startup self-test ────────────────────────────────────────────────────
+
+    def test_gemini(self) -> tuple:
+        """
+        Send a tiny synthetic image (solid grey JPEG) to Gemini and verify
+        we get any text response back (not an exception).
+
+        Returns (ok: bool, message: str).
+        Called once at agent startup so the user knows immediately if the
+        key is wrong / quota is zero / the model name is invalid.
+        """
+        if not self.gemini_enabled:
+            return False, "GEMINI_API_KEY is not set — Gemini is disabled"
+
+        try:
+            # 64x64 neutral grey — safe content, no chance of a safety block
+            img = Image.new("RGB", (64, 64), color=(128, 128, 128))
+            buf = BytesIO()
+            img.save(buf, format="JPEG", quality=85)
+            test_bytes = buf.getvalue()
+
+            image_part = {"mime_type": "image/jpeg", "data": test_bytes}
+            response = self._model.generate_content(
+                contents=["Reply with exactly one word: READY", image_part],
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.0, max_output_tokens=16,
+                ),
+                request_options={"timeout": 45},
+            )
+            text = self._get_response_text(response)
+            if text is not None:
+                return True, f"Gemini OK — model={Config.GEMINI_MODEL!r}, response={text!r}"
+            return False, f"Gemini returned empty/blocked response on test call"
+
+        except Exception as exc:
+            return False, f"Gemini test failed: {type(exc).__name__}: {exc}"
 
     # ── Combined evaluate ─────────────────────────────────────────────────────
 
