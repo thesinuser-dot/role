@@ -208,12 +208,20 @@ class AIProviderRouter:
     ) -> Optional[str]:
         """
         Best-effort completion with provider fallback.
-        Gemini is tried first for image inputs. If it is unavailable or fails,
-        text-only fallbacks are tried in the configured provider order.
+
+        When image_bytes is provided this is a vision task:
+          - Gemini API is tried (it supports images).
+          - Groq and OpenRouter are SKIPPED — they are text-only APIs and
+            cannot accept image inputs, so falling back to them would silently
+            drop the image and return a hallucinated answer.
+
+        When image_bytes is None (text-only task, e.g. hashtag generation):
+          - All providers are tried in the configured order.
         """
         tried = []
+        has_image = image_bytes is not None
 
-        # 1) Gemini gets first crack, especially when we have an image.
+        # 1) Gemini — supports both text and vision.
         if "gemini" in self._providers and self._gemini_model is not None:
             tried.append("gemini")
             try:
@@ -228,7 +236,17 @@ class AIProviderRouter:
             except Exception as exc:
                 self.log.warning("Gemini request failed: %s", exc)
 
-        # 2) Text-only fallbacks.
+        # 2) Text-only fallbacks — ONLY used when there is no image.
+        #    Groq and OpenRouter do not accept image inputs; using them for a
+        #    vision task would silently discard the screenshot and hallucinate.
+        if has_image:
+            self.log.warning(
+                "Image task: skipping Groq and OpenRouter — "
+                "they are text-only and cannot evaluate screenshots. "
+                "Configure GEMINI_API_KEY or enable Gemini Web fallback."
+            )
+            return None
+
         for provider in self._providers:
             if provider in tried:
                 continue
