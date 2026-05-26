@@ -22,10 +22,6 @@ on:
         required: false
         default: "false"
 
-concurrency:
-  group: reels-hunter-${{ github.ref }}
-  cancel-in-progress: false
-
 env:
   MIN_VIEWS:               ${{ github.event.inputs.min_views  || '50000' }}
   MAX_QUALIFIED_SEND:      ${{ github.event.inputs.max_reels  || '5' }}
@@ -339,7 +335,7 @@ jobs:
           GEMINI_API_KEY:            ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN:        ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:          ${{ secrets.TELEGRAM_CHAT_ID }}
-          TIKTOK_SESSION_ID:         ${{ secrets.TIKTOK_SESSION_ID }}
+          TIKTOK_SESSION_COOKIES:    ${{ secrets.TIKTOK_SESSION_COOKIES }}
           TIKTOK_COOKIES_FILE:       /run/secrets/tiktok_cookies.txt
         run: |
           echo "DISPLAY=$DISPLAY"
