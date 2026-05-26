@@ -21,6 +21,7 @@ from typing import List, Tuple, Optional
 from PIL import Image
 import google.generativeai as genai
 
+from ai_router import AIProviderRouter, parse_hashtags
 from config import Config
 
 
@@ -72,18 +73,13 @@ class VisionEvaluator:
 
     def __init__(self, gemini_api_key: str):
         self.log = logging.getLogger("VisionEvaluator")
-        self.gemini_enabled = False
-        if gemini_api_key:
-            try:
-                genai.configure(api_key=gemini_api_key)
-                self._model = genai.GenerativeModel(Config.GEMINI_MODEL)
-                self.gemini_enabled = True
-                self.log.info(f"Gemini Vision ready — model={Config.GEMINI_MODEL}")
-            except Exception as exc:
-                # Init failure is permanent (bad key, missing package, etc.)
-                self.log.error(f"Gemini init failed: {exc}")
+        self._ai = AIProviderRouter()
+        self._model = self._ai._gemini_model
+        self.gemini_enabled = self._ai.gemini_ready
+        if self.gemini_enabled:
+            self.log.info(f"Gemini Vision ready — model={Config.GEMINI_MODEL}")
         else:
-            self.log.warning("GEMINI_API_KEY not set — Stage 2 vision disabled.")
+            self.log.warning("Gemini not available — Stage 2 vision disabled.")
 
     # ── Stage 1: local Pillow pixel analysis ──────────────────────────────────
 
@@ -301,6 +297,43 @@ class VisionEvaluator:
             return False, f"Gemini test failed: {type(exc).__name__}: {exc}"
 
     # ── Combined evaluate ─────────────────────────────────────────────────────
+
+    def suggest_hashtags(
+        self,
+        screenshot_bytes: bytes,
+        views: int = 0,
+        likes: int = 0,
+        caption: str = "",
+        limit: int = 10,
+    ) -> list[str]:
+        """
+        Ask the configured AI stack for hashtags that fit this reel.
+        This does not modify the video. It only returns metadata suggestions.
+        """
+        compressed = self._compress_for_gemini(screenshot_bytes)
+        prompt = (
+            "Generate concise hashtags for an authorized TikTok repost/edit. "
+            "Return ONLY hashtags separated by commas. No explanation. "
+            "Use 6 to 10 hashtags maximum. Avoid personal tags, watermarks, or platform names.\n\n"
+            f"Views: {views:,}\n"
+            f"Likes: {likes:,}\n"
+            f"Caption: {caption[:400]}\n\n"
+            "Choose tags that match the visual style, e.g. cinematic, edit, aesthetic, anime, car, motion, night, luxury, quote, or gaming when appropriate."
+        )
+
+        raw = None
+        try:
+            raw = self._ai.complete(prompt, image_bytes=compressed, max_output_tokens=120)
+        except Exception as exc:
+            self.log.warning(f"Hashtag generation failed: {exc}")
+
+        tags = parse_hashtags(raw or "", limit=limit)
+        if tags:
+            return tags
+
+        # Conservative fallback when the model is unavailable or returns junk.
+        fallback = ["#edit", "#aesthetic", "#cinematic", "#viral"]
+        return fallback[:limit]
 
     def evaluate(self, screenshot_bytes: bytes, views: int = 0, likes: int = 0) -> Tuple[bool, str]:
         self.log.info("Vision Stage 1: local border pixel analysis")
