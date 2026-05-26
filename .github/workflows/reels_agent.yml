@@ -151,6 +151,8 @@ jobs:
           ngrok config add-authtoken "$NGROK_AUTHTOKEN"
           ngrok http ${WEB_PORT} --log=stdout --log-format=json \
             --request-header-add "ngrok-skip-browser-warning:true" > /tmp/ngrok.log 2>&1 &
+          NGROK_PID=$!
+          echo "Ngrok started (PID=$NGROK_PID)"
 
           python3 - << 'PYEOF'
           import time, json, os, urllib.request, sys
@@ -158,8 +160,11 @@ jobs:
           TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
           CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
+          # Give ngrok a few seconds to establish the tunnel before polling
+          time.sleep(5)
+
           url = None
-          for _ in range(30):
+          for attempt in range(60):
               try:
                   with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels", timeout=3) as r:
                       d = json.load(r)
@@ -172,7 +177,13 @@ jobs:
               time.sleep(1)
 
           if not url:
-              print("ERROR: Ngrok tunnel not found")
+              print("ERROR: Ngrok tunnel not found after 60s")
+              try:
+                  with open("/tmp/ngrok.log") as f:
+                      print("=== ngrok log ===")
+                      print(f.read()[-3000:])
+              except Exception:
+                  pass
               sys.exit(1)
 
           print(f"Tunnel ready: {url}")
@@ -266,7 +277,7 @@ jobs:
                    "--request-header-add", "ngrok-skip-browser-warning:true"],
                   stdout=open("/tmp/ngrok.log", "w"), stderr=subprocess.STDOUT
               )
-              time.sleep(5)
+              time.sleep(15)
               url = get_ngrok_url()
               if url:
                   with open("/tmp/ngrok_url", "w") as f:
