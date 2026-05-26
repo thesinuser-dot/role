@@ -2,17 +2,13 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # gemini_web_browser.py — Gemini Web fallback reusing the existing browser tab
 #
-# Reuses the EXISTING page already open in BrowserManager (never opens a new
-# tab).  Injects cookies first; if the page still shows the Sign-in screen,
-# falls back to manual email/password login via GEMINI_EMAIL / GEMINI_PASSWORD.
-#
-# Workflow:
-#   1. Navigate the existing page to gemini.google.com
-#   2. Inject cookies → reload → check if logged in
-#   3. If not logged in and creds set → do manual login
-#   4. Screenshot the reel → copy to system clipboard → Ctrl+V into Gemini input
-#   5. Type prompt as ONE paragraph (no trailing filler text)
-#   6. Submit → wait for response → screenshot → send to Telegram
+# Fix log:
+#   • sameSite values from JSON exports (no_restriction, lax, etc.) are
+#     sanitized to Playwright-legal values (Strict|Lax|None) before inject.
+#   • Never opens a new tab — reuses the injected existing page.
+#   • Cookie inject → login check → manual login fallback if needed.
+#   • Pastes reel screenshot via clipboard (xclip/wl-copy) FIRST, then
+#     types the prompt as one clean paragraph.
 # ─────────────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
@@ -28,7 +24,50 @@ from typing import Optional, Tuple
 log = logging.getLogger("GeminiWebBrowser")
 
 GEMINI_URL       = "https://gemini.google.com/app"
-GOOGLE_LOGIN_URL = "https://accounts.google.com/signin"
+GOOGLE_LOGIN_URL = "https://accounts.google.com/signin/v2/identifier"
+
+# Playwright only accepts these three sameSite values
+_VALID_SAME_SITE = {"Strict", "Lax", "None"}
+
+
+def _sanitize_cookie(c: dict, default_domain: str) -> dict:
+    """
+    Normalise a raw cookie dict so Playwright's add_cookies() won't crash.
+    Fixes: sameSite, expires, domain, missing fields.
+    """
+    # sameSite: map any export value → Strict | Lax | None
+    raw_ss = str(c.get("sameSite") or c.get("same_site") or "").lower().replace("_", "").replace("-", "")
+    if raw_ss == "strict":
+        same_site = "Strict"
+    elif raw_ss == "lax":
+        same_site = "Lax"
+    else:
+        same_site = "None"   # 'no_restriction', 'unspecified', empty → None
+
+    # expires: must be a positive int; some exports use float or -1
+    raw_exp = c.get("expirationDate") or c.get("expires") or 2147483647
+    try:
+        expires = int(float(raw_exp))
+        if expires <= 0:
+            expires = 2147483647
+    except (TypeError, ValueError):
+        expires = 2147483647
+
+    # domain: must start with dot for host-cookies
+    domain = str(c.get("domain") or default_domain)
+    if domain and not domain.startswith(".") and not domain.startswith("http"):
+        domain = "." + domain.lstrip(".")
+
+    return {
+        "name":     str(c.get("name", "")),
+        "value":    str(c.get("value", "")),
+        "domain":   domain,
+        "path":     str(c.get("path") or "/"),
+        "secure":   bool(c.get("secure", True)),
+        "httpOnly": bool(c.get("httpOnly", False)),
+        "sameSite": same_site,
+        "expires":  expires,
+    }
 
 
 class GeminiWebBrowser:
@@ -42,12 +81,10 @@ class GeminiWebBrowser:
         self._notifier = notifier
 
     def set_context(self, ctx) -> None:
-        """Inject the existing Playwright BrowserContext from BrowserManager."""
         self._ctx = ctx
         log.info("GeminiWebBrowser: BrowserContext injected.")
 
     def set_page(self, page) -> None:
-        """Inject the existing Page so we never open a new tab."""
         self._page = page
         log.info("GeminiWebBrowser: existing Page injected.")
 
@@ -57,60 +94,80 @@ class GeminiWebBrowser:
         raw = self._cookies_raw.strip()
         if not raw:
             return []
+        cookies = []
+        # Try JSON array first
         try:
             parsed = json.loads(raw)
             if isinstance(parsed, list):
-                return parsed
+                for c in parsed:
+                    if c.get("name"):
+                        cookies.append(_sanitize_cookie(c, ".google.com"))
+                if cookies:
+                    return cookies
         except (json.JSONDecodeError, ValueError):
             pass
-        cookies = []
+
+        # Fallback: semicolon-separated key=value string
         for part in raw.replace(";", "\n").splitlines():
             part = part.strip()
             if "=" in part:
-                k, v = part.split("=", 1)
-                cookies.append({
+                k, _, v = part.partition("=")
+                cookies.append(_sanitize_cookie({
                     "name": k.strip(), "value": v.strip(),
-                    "domain": ".google.com", "path": "/",
-                    "httpOnly": False, "secure": True,
-                })
+                    "domain": ".google.com",
+                }, ".google.com"))
         return cookies
 
     def _inject_cookies(self) -> int:
         cookies = self._parse_cookies()
-        if cookies and self._ctx:
+        if not cookies or not self._ctx:
+            return 0
+        try:
             self._ctx.add_cookies(cookies)
             log.info(f"Injected {len(cookies)} Gemini cookie(s).")
-        return len(cookies)
+            return len(cookies)
+        except Exception as exc:
+            log.warning(f"Cookie injection error: {exc} — skipping cookies.")
+            return 0
 
-    # ── Login state ───────────────────────────────────────────────────────────
+    # ── Login detection ───────────────────────────────────────────────────────
 
     def _is_logged_in(self) -> bool:
-        """Return True if we're inside the Gemini chat UI (not on sign-in)."""
         try:
-            url = self._page.url
-            if "accounts.google.com" in url or "signin" in url.lower():
+            url = self._page.url or ""
+            if "accounts.google.com" in url:
                 return False
-            # Sign-in button visible → not logged in
-            sign_in = self._page.query_selector(
-                "a[href*='accounts.google.com'], [aria-label*='Sign in'], a[href*='signin']"
-            )
-            if sign_in and sign_in.is_visible():
-                return False
-            # If the prompt input exists → logged in
+            # Sign-in button present = not logged in
+            for sel in [
+                "a[href*='accounts.google.com/signin']",
+                "a[aria-label*='Sign in']",
+                "a[data-action='sign in']",
+                ".sign-in-button",
+            ]:
+                try:
+                    el = self._page.query_selector(sel)
+                    if el and el.is_visible():
+                        return False
+                except Exception:
+                    pass
+            # Prompt input present = logged in
             for sel in [
                 "rich-textarea div[contenteditable='true']",
                 "div[contenteditable='true'][role='textbox']",
                 "textarea[placeholder]",
             ]:
-                el = self._page.query_selector(sel)
-                if el and el.is_visible():
-                    return True
+                try:
+                    el = self._page.query_selector(sel)
+                    if el and el.is_visible():
+                        return True
+                except Exception:
+                    pass
+            # If none found, assume not logged in
             return False
         except Exception:
             return False
 
     def _manual_login(self) -> bool:
-        """Perform Google account login using GEMINI_EMAIL + GEMINI_PASSWORD."""
         try:
             from config import Config
             email    = Config.GEMINI_EMAIL.strip()
@@ -119,95 +176,82 @@ class GeminiWebBrowser:
             email = password = ""
 
         if not email or not password:
-            log.warning("No GEMINI_EMAIL/GEMINI_PASSWORD set — cannot manual login.")
+            log.warning("GEMINI_EMAIL/GEMINI_PASSWORD not set — cannot manual login.")
             return False
 
-        log.info("Attempting manual Gemini/Google login...")
+        log.info("Attempting manual Google/Gemini login...")
         try:
             page = self._page
             page.goto(GOOGLE_LOGIN_URL, wait_until="domcontentloaded", timeout=30_000)
             time.sleep(2)
 
-            page.wait_for_selector("input[type='email']", timeout=10_000)
+            # Email step
+            page.wait_for_selector("input[type='email']", timeout=12_000)
             page.fill("input[type='email']", email)
+            time.sleep(0.5)
             page.keyboard.press("Enter")
             time.sleep(2)
 
-            page.wait_for_selector("input[type='password']", timeout=10_000)
+            # Password step
+            page.wait_for_selector("input[type='password']", timeout=12_000)
             page.fill("input[type='password']", password)
+            time.sleep(0.5)
             page.keyboard.press("Enter")
-            time.sleep(4)
+            time.sleep(5)
 
+            # Navigate to Gemini
             page.goto(GEMINI_URL, wait_until="domcontentloaded", timeout=30_000)
-            time.sleep(3)
+            time.sleep(4)
 
             if self._is_logged_in():
                 log.info("Manual Gemini login succeeded ✅")
                 return True
-            else:
-                log.error("Manual Gemini login failed — still not logged in.")
-                return False
-
+            log.error("Manual Gemini login failed — still not showing chat UI.")
+            return False
         except Exception as exc:
-            log.error(f"Manual login error: {exc}")
+            log.error(f"Manual login error: {type(exc).__name__}: {exc}")
             return False
 
     # ── Image clipboard paste ─────────────────────────────────────────────────
 
     def _put_image_on_clipboard(self, image_bytes: bytes, tmp_path: str) -> bool:
-        """
-        Write image_bytes to tmp_path and copy it to the system clipboard.
-        Tries xclip (X11) then wl-copy (Wayland).
-        Returns True if the clipboard command succeeded.
-        """
+        with open(tmp_path, "wb") as f:
+            f.write(image_bytes)
+        # Try xclip (X11)
         try:
-            with open(tmp_path, "wb") as f:
-                f.write(image_bytes)
-
-            # xclip (X11)
             r = subprocess.run(
                 ["xclip", "-selection", "clipboard", "-t", "image/png", "-i", tmp_path],
-                capture_output=True,
+                capture_output=True, timeout=5,
             )
             if r.returncode == 0:
-                log.info("Image copied to clipboard via xclip ✅")
+                log.info("Image on clipboard via xclip ✅")
                 return True
-
-            # wl-copy (Wayland)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+        # Try wl-copy (Wayland)
+        try:
             with open(tmp_path, "rb") as f:
                 r2 = subprocess.run(
                     ["wl-copy", "--type", "image/png"],
-                    input=f.read(),
-                    capture_output=True,
+                    input=f.read(), capture_output=True, timeout=5,
                 )
             if r2.returncode == 0:
-                log.info("Image copied to clipboard via wl-copy ✅")
+                log.info("Image on clipboard via wl-copy ✅")
                 return True
-
-            log.warning("xclip and wl-copy both failed — clipboard paste unavailable.")
-            return False
-        except FileNotFoundError as exc:
-            log.warning(f"Clipboard tool not found ({exc}) — falling back to file upload.")
-            return False
-        except Exception as exc:
-            log.warning(f"_put_image_on_clipboard error: {exc}")
-            return False
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+        log.warning("xclip and wl-copy both unavailable.")
+        return False
 
     def _paste_image_into_gemini(self, image_bytes: bytes) -> bool:
-        """
-        Copy reel screenshot to clipboard then Ctrl+V into the Gemini input.
-        Falls back to the hidden file-input element if clipboard fails.
-        """
         tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
         tmp_path = tmp.name
         tmp.close()
-
         try:
             clipboard_ok = self._put_image_on_clipboard(image_bytes, tmp_path)
             page = self._page
 
             if clipboard_ok:
-                # Click the input area first, then paste
                 for sel in [
                     "rich-textarea div[contenteditable='true']",
                     "div[contenteditable='true'][role='textbox']",
@@ -226,7 +270,7 @@ class GeminiWebBrowser:
                     except Exception:
                         continue
 
-            # Fallback: file input upload
+            # Fallback: file input
             log.info("Clipboard paste failed — trying file-input upload...")
             for sel in ["input[type='file']", "[data-testid='file-upload']"]:
                 try:
@@ -241,7 +285,6 @@ class GeminiWebBrowser:
 
             log.warning("Could not paste or upload image to Gemini.")
             return False
-
         finally:
             try:
                 os.unlink(tmp_path)
@@ -256,67 +299,54 @@ class GeminiWebBrowser:
         image_bytes: Optional[bytes] = None,
         timeout_ms: int = 60_000,
     ) -> Tuple[Optional[str], Optional[bytes]]:
-        """
-        Use the EXISTING browser page (never opens a new tab) to query Gemini.
-
-        Order of operations:
-          1. Inject cookies, navigate to Gemini
-          2. If not logged in → manual login
-          3. Paste the reel screenshot from clipboard (image FIRST)
-          4. Type the prompt as one clean paragraph
-          5. Submit → wait for response → screenshot → Telegram
-        """
         if self._ctx is None:
             log.error("No BrowserContext — call set_context() first.")
             return None, None
 
-        # Resolve page: use injected page or first open page in context
+        # Resolve page
         page = self._page
         if page is None:
             pages = self._ctx.pages
             if pages:
                 page = pages[0]
                 self._page = page
-                log.info("GeminiWebBrowser: using first existing page in context.")
+                log.info("Using first existing page in context.")
             else:
                 log.error("No existing page found in context.")
                 return None, None
 
         try:
-            # ── 1. Inject cookies + navigate ─────────────────────────────────
+            # 1. Inject cookies + navigate
             self._inject_cookies()
             log.info("Navigating to Gemini (existing tab)...")
             page.goto(GEMINI_URL, wait_until="domcontentloaded", timeout=30_000)
             time.sleep(3)
 
-            # ── 2. Login check ────────────────────────────────────────────────
+            # 2. Login check → manual login if needed
             if not self._is_logged_in():
-                log.warning("Not logged in to Gemini — trying manual login...")
-                ok = self._manual_login()
-                if not ok:
+                log.warning("Gemini: not logged in — attempting manual login...")
+                if not self._manual_login():
                     snap = page.screenshot(type="jpeg", quality=80)
-                    self._send_screenshot(snap, "❌ Gemini: login failed — check GEMINI_EMAIL/PASSWORD")
+                    self._send_screenshot(snap, "❌ Gemini: login failed — set GEMINI_EMAIL + GEMINI_PASSWORD secrets")
                     return None, snap
 
-            # ── 3. Paste reel screenshot FIRST ────────────────────────────────
+            # 3. Paste reel screenshot FIRST
             if image_bytes:
-                log.info("Pasting reel screenshot into Gemini input...")
+                log.info("Pasting reel screenshot into Gemini...")
                 self._paste_image_into_gemini(image_bytes)
                 time.sleep(1)
 
-            # ── 4. Type prompt as ONE clean paragraph ────────────────────────
-            # Collapse all whitespace so it's a single paragraph; no trailing text
+            # 4. Type prompt as ONE clean paragraph
             clean_prompt = " ".join(prompt.split())[:4000]
 
-            input_selectors = [
+            typed = False
+            for sel in [
                 "rich-textarea div[contenteditable='true']",
                 "div[contenteditable='true'][role='textbox']",
                 "div.ql-editor[contenteditable='true']",
                 "textarea[placeholder]",
                 "div[contenteditable='true']",
-            ]
-            typed = False
-            for sel in input_selectors:
+            ]:
                 try:
                     el = page.wait_for_selector(sel, timeout=10_000)
                     if el and el.is_visible():
@@ -332,15 +362,15 @@ class GeminiWebBrowser:
             if not typed:
                 log.error("Could not find Gemini prompt input.")
                 snap = page.screenshot(type="jpeg", quality=80)
-                self._send_screenshot(snap, "❌ Gemini Web: could not find prompt input")
+                self._send_screenshot(snap, "❌ Gemini Web: prompt input not found")
                 return None, snap
 
-            # ── 5. Submit ─────────────────────────────────────────────────────
+            # 5. Submit
             time.sleep(0.5)
             page.keyboard.press("Enter")
-            log.info("Prompt submitted — waiting for Gemini response...")
+            log.info("Prompt submitted — waiting for response...")
 
-            # ── 6. Wait for response ──────────────────────────────────────────
+            # 6. Wait for response
             response_text = None
             for _ in range(30):
                 time.sleep(1)
@@ -367,7 +397,6 @@ class GeminiWebBrowser:
 
             time.sleep(1)
             snap = page.screenshot(type="jpeg", quality=85)
-            log.info(f"Screenshot taken: {len(snap)//1024} KB")
 
             try:
                 from config import Config
@@ -391,6 +420,5 @@ class GeminiWebBrowser:
             return
         try:
             self._notifier.send_photo(screenshot_bytes, caption=caption)
-            log.info("Gemini screenshot sent to Telegram.")
         except Exception as exc:
-            log.warning(f"Could not send screenshot to Telegram: {exc}")
+            log.warning(f"Could not send screenshot: {exc}")
