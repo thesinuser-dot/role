@@ -54,10 +54,10 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Restore history.db cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: history.db
-          key: reels-history-db-${{ github.run_id }}
+          key: reels-history-db-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             reels-history-db-
 
@@ -209,7 +209,7 @@ jobs:
               req = urllib.request.Request(
                   f"https://api.telegram.org/bot{TOKEN}/sendMessage",
                   data=data, headers={"Content-Type": "application/json"}
-              )
+                )
               try:
                   with urllib.request.urlopen(req, timeout=10) as r:
                       return json.load(r)
@@ -265,7 +265,8 @@ jobs:
           offset  = (results[-1]["update_id"] + 1) if results else 0
           print(f"Polling from offset {offset}.")
 
-          for i in range(660):
+          # تم تعديل النطاق إلى 60 دورة (5 دقائق تقريباً) لمنع تعليق خوادم GitHub Actions
+          for i in range(60):
               resp    = tg_get("getUpdates", {"offset": str(offset), "limit": "10", "timeout": "4"})
               updates = resp.get("result", [])
 
@@ -289,7 +290,7 @@ jobs:
 
               time.sleep(5)
 
-          print("55-min timeout -- continuing.")
+          print("Timeout reached -- continuing to run agent automatically.")
           PYEOF
 
       - name: Set up Python 3.10
@@ -353,7 +354,7 @@ jobs:
 
       - name: Save history.db
         if: always()
-        uses: actions/cache@v4
+        uses: actions/cache/save@v4
         with:
           path: history.db
-          key: reels-history-db-${{ github.run_id }}
+          key: reels-history-db-${{ github.run_id }}-${{ github.run_attempt }}
