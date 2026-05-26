@@ -237,10 +237,38 @@ class TikTokPoster:
             schedule=None,
         )
 
+    def _save_cookies(self, ctx) -> Path:
+        """Dump Playwright context cookies to a Netscape-format temp file."""
+        raw_cookies = ctx.cookies()
+        tmp = tempfile.NamedTemporaryFile(
+            suffix=".txt", prefix="tiktok_login_cookies_", delete=False
+        )
+        tmp.write(b"# Netscape HTTP Cookie File\n\n")
+        for c in raw_cookies:
+            secure  = "TRUE" if c.get("secure") else "FALSE"
+            http    = "TRUE" if c.get("httpOnly") else "FALSE"
+            expires = str(int(c.get("expires") or 9999999999))
+            domain  = c.get("domain", ".tiktok.com")
+            line = (
+                f"{domain}\t{http}\t{c['path']}\t"
+                f"{secure}\t{expires}\t{c['name']}\t{c['value']}\n"
+            )
+            tmp.write(line.encode())
+        tmp.close()
+        self._temp_cookies = Path(tmp.name)
+        self._cookies_path = Path(tmp.name)
+        log.info(f"TikTok cookies saved to {tmp.name}")
+        return Path(tmp.name)
+
     def _manual_login_and_save_cookies(self) -> bool:
         """
-        Open a visible TikTok browser, log in with email+password, then export
-        the fresh session cookies to a temp file so subsequent uploads work.
+        Open a visible TikTok browser and log in with email+password following
+        the exact UI flow:
+          1. tiktok.com  ->  click "Log in"
+          2. "Use phone or email" button
+          3. "Use email or username" tab
+          4. Fill email + password -> submit
+        Exports fresh session cookies to a temp file for subsequent uploads.
         Returns True if login succeeded.
         """
         email    = Config.TIKTOK_EMAIL.strip()
@@ -251,52 +279,102 @@ class TikTokPoster:
 
         log.info("TikTok: attempting manual login via browser...")
         try:
-            from playwright.sync_api import sync_playwright
+            from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
             with sync_playwright() as p:
-                browser = p.chromium.launch(headless=False)
-                ctx     = browser.new_context()
-                page    = ctx.new_page()
+                browser = p.chromium.launch(headless=Config.TIKTOK_HEADLESS)
+                ctx = browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"
+                    )
+                )
+                page = ctx.new_page()
 
-                page.goto("https://www.tiktok.com/login/phone-or-email/email",
-                          wait_until="domcontentloaded", timeout=30_000)
+                # Step 1: land on TikTok home
+                log.info("TikTok login step 1: opening tiktok.com...")
+                page.goto("https://www.tiktok.com", wait_until="domcontentloaded", timeout=30_000)
+                time.sleep(3)
+
+                # Step 2: click the "Log in" button
+                log.info("TikTok login step 2: clicking Log in...")
+                for sel in ["[data-e2e='nav-login-button']", "text=Log in"]:
+                    try:
+                        page.click(sel, timeout=6_000)
+                        break
+                    except PWTimeout:
+                        continue
                 time.sleep(2)
 
-                page.fill("input[name='username'], input[type='text']", email)
+                # Step 3: click "Use phone or email"
+                log.info("TikTok login step 3: selecting phone/email option...")
+                for sel in [
+                    "div[data-e2e='channel-item']:has-text('Use phone or email')",
+                    "text=Use phone or email",
+                ]:
+                    try:
+                        page.click(sel, timeout=6_000)
+                        break
+                    except PWTimeout:
+                        continue
+                time.sleep(2)
+
+                # Step 4: switch to "Email or username" tab
+                log.info("TikTok login step 4: switching to email/username tab...")
+                for sel in [
+                    "text=Use email or username",
+                    "a:has-text('Use email or username')",
+                    "[href*='/login/phone-or-email/email']",
+                ]:
+                    try:
+                        page.click(sel, timeout=6_000)
+                        break
+                    except PWTimeout:
+                        continue
+                time.sleep(1)
+
+                # Step 5: fill email
+                log.info("TikTok login step 5: filling email...")
+                page.wait_for_selector(
+                    "input[name='username'], input[autocomplete='username'], input[type='text']",
+                    timeout=10_000,
+                )
+                page.fill(
+                    "input[name='username'], input[autocomplete='username'], input[type='text']",
+                    email,
+                )
                 time.sleep(0.5)
+
+                # Step 6: fill password
+                log.info("TikTok login step 6: filling password...")
+                page.wait_for_selector("input[type='password']", timeout=8_000)
                 page.fill("input[type='password']", password)
                 time.sleep(0.5)
+
+                # Step 7: submit
+                log.info("TikTok login step 7: submitting...")
                 page.keyboard.press("Enter")
-                time.sleep(6)
+                time.sleep(8)
 
                 if "tiktok.com" in page.url and "login" not in page.url:
                     log.info("TikTok manual login succeeded ✅")
-                    raw_cookies = ctx.cookies()
-                    tmp = tempfile.NamedTemporaryFile(
-                        suffix=".txt", prefix="tiktok_login_cookies_", delete=False
-                    )
-                    tmp.write(b"# Netscape HTTP Cookie File\n\n")
-                    for c in raw_cookies:
-                        # Sanitize sameSite for Netscape format (TRUE/FALSE)
-                        secure  = "TRUE" if c.get("secure") else "FALSE"
-                        http    = "TRUE" if c.get("httpOnly") else "FALSE"
-                        expires = str(int(c.get("expires") or 9999999999))
-                        domain  = c.get("domain", ".tiktok.com")
-                        line = (
-                            f"{domain}\t{http}\t{c['path']}\t"
-                            f"{secure}\t{expires}\t{c['name']}\t{c['value']}\n"
-                        )
-                        tmp.write(line.encode())
-                    tmp.close()
-                    self._temp_cookies = Path(tmp.name)
-                    self._cookies_path = Path(tmp.name)
-                    log.info(f"TikTok cookies saved to {tmp.name}")
+                    self._save_cookies(ctx)
                     browser.close()
                     return True
-                else:
-                    log.error("TikTok manual login failed — still on login page.")
+
+                # Captcha / 2FA may need extra time
+                log.warning("TikTok login: waiting for possible captcha/2FA...")
+                time.sleep(10)
+                if "tiktok.com" in page.url and "login" not in page.url:
+                    log.info("TikTok manual login succeeded after extra wait ✅")
+                    self._save_cookies(ctx)
                     browser.close()
-                    return False
+                    return True
+
+                log.error(f"TikTok manual login failed — still on: {page.url}")
+                browser.close()
+                return False
 
         except Exception as exc:
             log.error(f"TikTok manual login error: {exc}")
