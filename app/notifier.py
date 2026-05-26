@@ -63,6 +63,21 @@ class NotificationService:
         self.log.error(f"Telegram {endpoint} failed after {max_retries} attempts.")
         return None
 
+    # ── Connection test ───────────────────────────────────────────────────────
+
+    def test_connection(self) -> bool:
+        """Verify Telegram credentials by calling getMe. Logs result and returns success bool."""
+        if not self.enabled:
+            self.log.warning("[Telegram] test_connection skipped — notifications disabled.")
+            return False
+        result = self._request("GET", "getMe")
+        if result and result.get("ok"):
+            bot_name = result.get("result", {}).get("username", "unknown")
+            self.log.info(f"[Telegram] Connection OK — bot: @{bot_name}")
+            return True
+        self.log.error("[Telegram] test_connection failed — check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.")
+        return False
+
     # ── Public send methods ───────────────────────────────────────────────────
 
     def send_message(self, text: str, parse_mode: str = "HTML") -> Optional[Dict]:
