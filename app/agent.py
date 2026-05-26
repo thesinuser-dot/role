@@ -480,6 +480,97 @@ class InstagramAgent:
         self.log.info(f"No RDP display found — using DISPLAY={current or ':99'} (Xvfb)")
         return False
 
+    def _open_startup_tabs(self) -> None:
+        """
+        Immediately open Instagram, TikTok, and Gemini as separate tabs in the
+        existing browser context so the user can see all three on startup.
+        The main Instagram page is already tab 0 — we add TikTok and Gemini.
+        """
+        ctx = self.bm._ctx
+        if ctx is None:
+            self.log.warning("No browser context yet — skipping startup tabs.")
+            return
+
+        tabs = [
+            ("Instagram Reels", "https://www.instagram.com/reels/"),
+            ("TikTok",          "https://www.tiktok.com/"),
+            ("Gemini",          "https://gemini.google.com/app"),
+        ]
+
+        # The main page (tab 0) is already open — navigate it to Instagram
+        try:
+            self.log.info("Startup tab: Instagram → navigating main page...")
+            self.bm.page.goto(
+                "https://www.instagram.com/reels/",
+                wait_until="domcontentloaded",
+                timeout=20_000,
+            )
+        except Exception as exc:
+            self.log.warning(f"Startup tab Instagram navigation failed (non-fatal): {exc}")
+
+        # Open TikTok in a new tab
+        try:
+            self.log.info("Startup tab: opening TikTok...")
+            tiktok_page = ctx.new_page()
+            tiktok_page.goto(
+                "https://www.tiktok.com/",
+                wait_until="domcontentloaded",
+                timeout=20_000,
+            )
+            self.log.info("Startup tab: TikTok opened ✅")
+        except Exception as exc:
+            self.log.warning(f"Startup tab TikTok failed (non-fatal): {exc}")
+
+        # Open Gemini in a new tab
+        try:
+            self.log.info("Startup tab: opening Gemini...")
+            gemini_page = ctx.new_page()
+            gemini_page.goto(
+                "https://gemini.google.com/app",
+                wait_until="domcontentloaded",
+                timeout=20_000,
+            )
+            # Inject Gemini cookies if set
+            if Config.GEMINI_COOKIES:
+                try:
+                    import json as _json
+                    raw = Config.GEMINI_COOKIES.strip()
+                    cookies = []
+                    try:
+                        parsed = _json.loads(raw)
+                        if isinstance(parsed, list):
+                            cookies = parsed
+                    except Exception:
+                        for part in raw.replace(";", "\n").splitlines():
+                            part = part.strip()
+                            if "=" in part:
+                                k, v = part.split("=", 1)
+                                cookies.append({
+                                    "name": k.strip(), "value": v.strip(),
+                                    "domain": ".google.com", "path": "/",
+                                    "httpOnly": False, "secure": True,
+                                })
+                    if cookies:
+                        ctx.add_cookies(cookies)
+                        gemini_page.reload(wait_until="domcontentloaded", timeout=15_000)
+                        self.log.info(f"Gemini: injected {len(cookies)} cookies and reloaded.")
+                except Exception as exc:
+                    self.log.warning(f"Gemini cookie injection failed (non-fatal): {exc}")
+
+            # Store gemini page so GeminiWebBrowser can reuse it
+            self._gemini_page = gemini_page
+            self.log.info("Startup tab: Gemini opened ✅")
+        except Exception as exc:
+            self.log.warning(f"Startup tab Gemini failed (non-fatal): {exc}")
+            self._gemini_page = None
+
+        # Give the GeminiWebBrowser access to the shared context
+        if getattr(self.vision, '_gemini_web_browser', None):
+            self.vision._gemini_web_browser.set_context(ctx)
+            self.log.info("GeminiWebBrowser: shared browser context injected ✅")
+
+        self.log.info("✅ All startup tabs opened: Instagram | TikTok | Gemini")
+
     def setup(self) -> bool:
         self.log.info("\n" + Config.summary())
 
@@ -508,6 +599,9 @@ class InstagramAgent:
             return False
 
         self.collector = ReelCollector(self.bm)
+
+        # ── Open Instagram, TikTok, and Gemini tabs instantly on startup ──────
+        self._open_startup_tabs()
 
         try:
             self._retry_pending_uploads()
