@@ -13,6 +13,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import subprocess
+import tempfile
 import requests
 
 from config import Config
@@ -75,17 +77,52 @@ class NotificationService:
             },
         )
 
-    def send_video(
-        self, video_path: Path, caption: str = "", parse_mode: str = "HTML"
-    ) -> Optional[Dict]:
-        if not video_path.exists():
-            self.log.error(f"[Telegram] Video not found: {video_path}")
+    def _compress_video(self, video_path: Path) -> Optional[Path]:
+        """
+        Re-encode with ffmpeg (H.264 CRF 28, 720p max) into a temp file.
+        Returns the compressed Path on success, None if ffmpeg fails.
+        Called only when the file exceeds TELEGRAM_MAX_VIDEO_MB.
+        """
+        try:
+            tmp = tempfile.NamedTemporaryFile(
+                suffix=".mp4", prefix="compressed_", delete=False,
+                dir=Config.DOWNLOAD_DIR,
+            )
+            tmp.close()
+            out_path = Path(tmp.name)
+
+            cmd = [
+                "ffmpeg", "-y", "-i", str(video_path),
+                "-c:v", "libx264",
+                "-crf", "28",
+                "-preset", "fast",
+                "-vf", "scale='min(iw,720)':'min(ih,1280)':force_original_aspect_ratio=decrease",
+                "-c:a", "aac", "-b:a", "96k",
+                "-movflags", "+faststart",
+                "-loglevel", "error",
+                str(out_path),
+            ]
+            result = subprocess.run(cmd, capture_output=True, timeout=120)
+            if result.returncode != 0:
+                self.log.warning(
+                    f"[ffmpeg] Compression failed (rc={result.returncode}): "
+                    f"{result.stderr.decode()[:300]}"
+                )
+                out_path.unlink(missing_ok=True)
+                return None
+
+            compressed_mb = out_path.stat().st_size / (1024 * 1024)
+            original_mb = video_path.stat().st_size / (1024 * 1024)
+            self.log.info(
+                f"[ffmpeg] Compressed {original_mb:.1f} MB → {compressed_mb:.1f} MB"
+            )
+            return out_path
+        except Exception as exc:
+            self.log.warning(f"[ffmpeg] Compression exception: {exc}")
             return None
-        size_mb = video_path.stat().st_size / (1024 * 1024)
-        self.log.info(f"[Telegram] Sending video: {video_path.name} ({size_mb:.1f} MB)")
-        if size_mb > Config.TELEGRAM_MAX_VIDEO_MB:
-            self.log.warning(f"[Telegram] File {size_mb:.1f} MB exceeds limit — sending link only.")
-            return self.send_message(f"Video too large ({size_mb:.1f} MB) to attach.\n{caption}")
+
+    def _upload_video(self, video_path: Path, caption: str, parse_mode: str) -> Optional[Dict]:
+        """Send a single video file via Telegram sendVideo."""
         with open(video_path, "rb") as fh:
             return self._request(
                 "POST", "sendVideo",
@@ -97,6 +134,53 @@ class NotificationService:
                 },
                 files={"video": (video_path.name, fh, "video/mp4")},
             )
+
+    def send_video(
+        self, video_path: Path, caption: str = "", parse_mode: str = "HTML"
+    ) -> Optional[Dict]:
+        if not video_path.exists():
+            self.log.error(f"[Telegram] Video not found: {video_path}")
+            return None
+
+        size_mb = video_path.stat().st_size / (1024 * 1024)
+        self.log.info(f"[Telegram] Sending video: {video_path.name} ({size_mb:.1f} MB)")
+
+        # ── File fits within Telegram limit — send directly ───────────────
+        if size_mb <= Config.TELEGRAM_MAX_VIDEO_MB:
+            return self._upload_video(video_path, caption, parse_mode)
+
+        # ── File too large — try ffmpeg compression ────────────────────────
+        self.log.warning(
+            f"[Telegram] {size_mb:.1f} MB > {Config.TELEGRAM_MAX_VIDEO_MB} MB limit "
+            f"— compressing with ffmpeg..."
+        )
+        compressed_path = self._compress_video(video_path)
+
+        if compressed_path is None:
+            # Compression failed entirely — send link as last resort
+            self.log.error("[Telegram] Compression failed — falling back to link.")
+            return self.send_message(
+                f"⚠️ Video too large to compress ({size_mb:.1f} MB).\n{caption}"
+            )
+
+        compressed_mb = compressed_path.stat().st_size / (1024 * 1024)
+        if compressed_mb > Config.TELEGRAM_MAX_VIDEO_MB:
+            # Still too big after compression
+            compressed_path.unlink(missing_ok=True)
+            self.log.error(
+                f"[Telegram] Compressed file still {compressed_mb:.1f} MB — sending link."
+            )
+            return self.send_message(
+                f"⚠️ Video still too large after compression ({compressed_mb:.1f} MB).\n{caption}"
+            )
+
+        # Send the compressed file, then clean it up regardless of outcome
+        try:
+            result = self._upload_video(compressed_path, caption, parse_mode)
+        finally:
+            compressed_path.unlink(missing_ok=True)
+
+        return result
 
     def send_photo(
         self, photo_data: bytes, caption: str = "", parse_mode: str = "HTML"
