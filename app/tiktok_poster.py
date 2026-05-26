@@ -25,8 +25,6 @@
 
 from __future__ import annotations
 
-import base64
-import json
 import logging
 import os
 import signal
@@ -262,101 +260,11 @@ class TikTokPoster:
         log.info(f"TikTok cookies saved to {tmp.name}")
         return Path(tmp.name)
 
-    def _push_cookies_to_github_secret(self, cookies_path: Path) -> bool:
-        """
-        After a successful manual login, automatically update the TIKTOK_COOKIES
-        GitHub Actions secret so the next run starts authenticated — no manual
-        copy-paste needed.
-
-        Requires two env vars (set them as GitHub secrets and pass through the
-        workflow):
-          GH_PAT            — Personal Access Token with repo secrets:write scope
-          GITHUB_REPOSITORY — automatically set by GitHub Actions (owner/repo)
-
-        The cookies file is base64-encoded before storage so Netscape characters
-        survive the secret round-trip.  The existing workflow "Write cookies
-        files" step already handles the base64-decode automatically.
-
-        Returns True on success, False if skipped or failed.
-        """
-        pat = os.environ.get("GH_PAT", "").strip()
-        repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
-        if not pat or not repo:
-            log.debug(
-                "GH_PAT or GITHUB_REPOSITORY not set — "
-                "skipping automatic TIKTOK_COOKIES secret update."
-            )
-            return False
-
-        import urllib.request
-        import urllib.error
-
-        try:
-            from nacl import encoding, public  # type: ignore
-        except ImportError:
-            log.warning(
-                "PyNaCl not installed — cannot auto-update GitHub secret. "
-                "Add 'PyNaCl' to requirements.txt to enable this feature."
-            )
-            return False
-
-        try:
-            raw = cookies_path.read_bytes()
-            encoded_cookies = base64.b64encode(raw).decode()
-
-            api = "https://api.github.com"
-            headers = {
-                "Authorization": f"Bearer {pat}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-                "Content-Type": "application/json",
-            }
-
-            def _gh(method: str, url: str, body: bytes | None = None) -> dict:
-                req = urllib.request.Request(
-                    url, data=body, headers=headers, method=method
-                )
-                with urllib.request.urlopen(req, timeout=15) as r:
-                    return json.loads(r.read())
-
-            # 1. Fetch the repo public key (needed to encrypt the secret)
-            pk = _gh("GET", f"{api}/repos/{repo}/actions/secrets/public-key")
-            pub_key_bytes = base64.b64decode(pk["key"])
-            key_id = pk["key_id"]
-
-            # 2. Encrypt with libsodium sealed box
-            box = public.SealedBox(public.PublicKey(pub_key_bytes))
-            encrypted = base64.b64encode(
-                box.encrypt(encoded_cookies.encode())
-            ).decode()
-
-            # 3. Upsert the secret
-            _gh(
-                "PUT",
-                f"{api}/repos/{repo}/actions/secrets/TIKTOK_COOKIES",
-                json.dumps({"encrypted_value": encrypted, "key_id": key_id}).encode(),
-            )
-
-            log.info(
-                "✅ TIKTOK_COOKIES GitHub secret updated automatically — "
-                "next run will use fresh cookies without any manual steps."
-            )
-            return True
-
-        except Exception as exc:
-            log.warning(f"Could not auto-update TIKTOK_COOKIES secret: {exc}")
-            return False
-
     def _manual_login_and_save_cookies(self) -> bool:
         """
-        Open a visible TikTok browser and log in with email+password following
-        the exact UI flow:
-          1. tiktok.com  ->  click "Log in"
-          2. "Use phone or email" button
-          3. "Use email or username" tab
-          4. Fill email + password -> submit
-        Exports fresh session cookies to a temp file for subsequent uploads.
-        Returns True if login succeeded.
+        Open a TikTok browser and log in with email+password.
+        Goes directly to the email login URL — skips the 4-step UI click chain
+        that breaks whenever TikTok updates their home page layout.
         """
         email    = Config.TIKTOK_EMAIL.strip()
         password = Config.TIKTOK_PASSWORD.strip()
@@ -379,89 +287,69 @@ class TikTokPoster:
                 )
                 page = ctx.new_page()
 
-                # Step 1: land on TikTok home
-                log.info("TikTok login step 1: opening tiktok.com...")
-                page.goto("https://www.tiktok.com", wait_until="domcontentloaded", timeout=30_000)
+                # Go directly to the email login page — no clicking through home
+                log.info("TikTok login: navigating directly to email login page...")
+                page.goto(
+                    "https://www.tiktok.com/login/phone-or-email/email",
+                    wait_until="domcontentloaded",
+                    timeout=30_000,
+                )
                 time.sleep(3)
 
-                # Step 2: click the "Log in" button
-                log.info("TikTok login step 2: clicking Log in...")
-                for sel in ["[data-e2e='nav-login-button']", "text=Log in"]:
+                # Fill email
+                log.info("TikTok login: filling email...")
+                try:
+                    page.wait_for_selector(
+                        "input[name='username'], input[autocomplete='username'], "
+                        "input[type='text']:not([type='password'])",
+                        timeout=12_000,
+                    )
+                    page.fill(
+                        "input[name='username'], input[autocomplete='username'], "
+                        "input[type='text']:not([type='password'])",
+                        email,
+                    )
+                except PWTimeout:
+                    log.error("TikTok login: email input not found — page may have changed.")
+                    # Take screenshot for debugging
                     try:
-                        page.click(sel, timeout=6_000)
-                        break
-                    except PWTimeout:
-                        continue
-                time.sleep(2)
-
-                # Step 3: click "Use phone or email"
-                log.info("TikTok login step 3: selecting phone/email option...")
-                for sel in [
-                    "div[data-e2e='channel-item']:has-text('Use phone or email')",
-                    "text=Use phone or email",
-                ]:
-                    try:
-                        page.click(sel, timeout=6_000)
-                        break
-                    except PWTimeout:
-                        continue
-                time.sleep(2)
-
-                # Step 4: switch to "Email or username" tab
-                log.info("TikTok login step 4: switching to email/username tab...")
-                for sel in [
-                    "text=Use email or username",
-                    "a:has-text('Use email or username')",
-                    "[href*='/login/phone-or-email/email']",
-                ]:
-                    try:
-                        page.click(sel, timeout=6_000)
-                        break
-                    except PWTimeout:
-                        continue
-                time.sleep(1)
-
-                # Step 5: fill email
-                log.info("TikTok login step 5: filling email...")
-                page.wait_for_selector(
-                    "input[name='username'], input[autocomplete='username'], input[type='text']",
-                    timeout=10_000,
-                )
-                page.fill(
-                    "input[name='username'], input[autocomplete='username'], input[type='text']",
-                    email,
-                )
+                        snap_path = "/tmp/tiktok_login_debug.png"
+                        page.screenshot(path=snap_path)
+                        log.info(f"Login debug screenshot saved to {snap_path}")
+                    except Exception:
+                        pass
+                    browser.close()
+                    return False
                 time.sleep(0.5)
 
-                # Step 6: fill password
-                log.info("TikTok login step 6: filling password...")
+                # Fill password
+                log.info("TikTok login: filling password...")
                 page.wait_for_selector("input[type='password']", timeout=8_000)
                 page.fill("input[type='password']", password)
                 time.sleep(0.5)
 
-                # Step 7: submit
-                log.info("TikTok login step 7: submitting...")
+                # Submit
+                log.info("TikTok login: submitting...")
                 page.keyboard.press("Enter")
-                time.sleep(8)
 
-                if "tiktok.com" in page.url and "login" not in page.url:
-                    log.info("TikTok manual login succeeded ✅")
-                    cookie_path = self._save_cookies(ctx)
-                    browser.close()
-                    self._push_cookies_to_github_secret(cookie_path)
-                    return True
+                # Wait for redirect away from login — up to 30s for captcha/2FA
+                log.info("TikTok login: waiting for redirect (captcha/2FA may add delay)...")
+                for waited in range(30):
+                    time.sleep(1)
+                    if "login" not in page.url and "tiktok.com" in page.url:
+                        log.info(f"TikTok manual login succeeded after {waited+1}s ✅")
+                        cookie_path = self._save_cookies(ctx)
+                        browser.close()
+                        self._push_cookies_to_github_secret(cookie_path)
+                        return True
 
-                # Captcha / 2FA may need extra time
-                log.warning("TikTok login: waiting for possible captcha/2FA...")
-                time.sleep(10)
-                if "tiktok.com" in page.url and "login" not in page.url:
-                    log.info("TikTok manual login succeeded after extra wait ✅")
-                    cookie_path = self._save_cookies(ctx)
-                    browser.close()
-                    self._push_cookies_to_github_secret(cookie_path)
-                    return True
-
-                log.error(f"TikTok manual login failed — still on: {page.url}")
+                log.error(f"TikTok manual login failed after 30s — still on: {page.url}")
+                try:
+                    snap_path = "/tmp/tiktok_login_failed.png"
+                    page.screenshot(path=snap_path)
+                    log.info(f"Failure screenshot saved to {snap_path}")
+                except Exception:
+                    pass
                 browser.close()
                 return False
 
@@ -520,6 +408,7 @@ class TikTokPoster:
             return False
 
         caption = _build_caption(reel_url, views, likes, extra_tags or [])
+        _login_attempted = False  # only try once per post() call
 
         for attempt in range(1, Config.TIKTOK_MAX_RETRIES + 1):
             try:
@@ -537,12 +426,15 @@ class TikTokPoster:
                     f"[TikTok] Upload attempt {attempt}/{Config.TIKTOK_MAX_RETRIES} "
                     f"failed: {exc}"
                 )
-                # If it looks like an auth/login error, try manual login once
-                if any(kw in err_str for kw in ("login", "sign in", "session", "auth", "cookie", "expired")):
-                    log.info("[TikTok] Auth error detected — attempting manual login...")
+                # On first failure always try login — don't wait for specific keywords.
+                # tiktok-uploader can throw generic errors (timeout, element not found)
+                # even when the real cause is expired cookies.
+                if not _login_attempted:
+                    _login_attempted = True
+                    log.info("[TikTok] First failure — attempting fresh login...")
                     if self._manual_login_and_save_cookies():
-                        log.info("[TikTok] Manual login done — retrying upload immediately...")
-                        continue  # retry this attempt with fresh cookies
+                        log.info("[TikTok] Login refreshed — retrying upload...")
+                        continue
 
                 if attempt < Config.TIKTOK_MAX_RETRIES:
                     sleep_s = 2 ** attempt
