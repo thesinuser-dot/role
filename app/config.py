@@ -33,6 +33,9 @@ class Config:
     GEMINI_COOKIES: str = os.environ.get("GEMINI_COOKIES", "")
     # Enable Gemini Web as a vision provider when API key is unavailable
     GEMINI_WEB_ENABLED: bool = os.environ.get("GEMINI_WEB_ENABLED", "true").strip().lower() == "true"
+    # Manual login fallback — used when cookies are absent/expired
+    GEMINI_EMAIL: str = os.environ.get("GEMINI_EMAIL", "")
+    GEMINI_PASSWORD: str = os.environ.get("GEMINI_PASSWORD", "")
 
     # ── Human approval (Telegram inline buttons) ──────────────────────────────
     # When True, each reel that passes AI vision is sent as a screenshot to
@@ -120,6 +123,9 @@ class Config:
     TIKTOK_SESSION_COOKIES: str = os.environ.get("TIKTOK_SESSION_COOKIES", "")
     # Backwards-compatible alias for older docs/scripts.
     TIKTOK_SESSION_ID: str = os.environ.get("TIKTOK_SESSION_ID", "")
+    # Manual login fallback — used when cookies are absent/expired
+    TIKTOK_EMAIL: str = os.environ.get("TIKTOK_EMAIL", "")
+    TIKTOK_PASSWORD: str = os.environ.get("TIKTOK_PASSWORD", "")
 
     # TikTok browser is ALWAYS visible (headless=False) so you can see the upload.
     TIKTOK_HEADLESS: bool = False
