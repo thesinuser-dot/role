@@ -87,6 +87,10 @@ class VisionEvaluator:
         self._gemini_web_browser: Optional[GeminiWebBrowser] = GeminiWebBrowser(Config.GEMINI_COOKIES)
         self.log.info("GeminiWebBrowser (visible) ready as quota/no-key fallback.")
 
+        # Once the API quota is hit during a run, skip directly to web browser
+        # for all subsequent reels instead of hammering the API on every check.
+        self._api_quota_hit: bool = False
+
         # Will be set by agent after notifier is available
         self._notifier = None
 
@@ -222,6 +226,11 @@ class VisionEvaluator:
                     return False, f"Gemini Web error (fail-closed): {exc}"
             return True, "Gemini disabled (no API key) — skipped"
 
+        # ── API quota already hit this run — skip straight to web browser ─────
+        if self._api_quota_hit and self._gemini_web_browser is not None:
+            self.log.info("API quota flagged — skipping API, using GeminiWebBrowser directly...")
+            return self._ask_gemini_web(self._compress_for_gemini(screenshot_bytes), reason="quota cached")
+
         compressed = self._compress_for_gemini(screenshot_bytes)
         last_exc: Optional[Exception] = None
         quota_exhausted = False
@@ -275,41 +284,48 @@ class VisionEvaluator:
                     break
 
         # ── All attempts exhausted ────────────────────────────────────────────
-        # Quota / rate-limit hit → switch to visible Gemini Web browser immediately
+        # Quota / rate-limit hit → flag it for the rest of the run, then use web
         if quota_exhausted and self._gemini_web_browser is not None:
+            self._api_quota_hit = True   # all future reels skip the API
             self.log.warning(
-                "Gemini API quota/rate limit hit — switching to GeminiWebBrowser (visible)..."
+                "Gemini API quota/rate limit hit — flagging for this run, "
+                "switching to GeminiWebBrowser (visible)..."
             )
-            try:
-                response_text, snap = self._gemini_web_browser.ask(
-                    self._GEMINI_PROMPT,
-                    image_bytes=compressed,
-                )
-                if snap and self._notifier:
-                    try:
-                        self._notifier.send_photo(
-                            snap,
-                            caption="🌐 <b>Gemini Web Vision Check</b> (API quota hit — switched to browser)",
-                        )
-                    except Exception as se:
-                        self.log.warning(f"Could not send Gemini Web screenshot: {se}")
-                if response_text:
-                    upper = response_text.upper()
-                    if "PASSED" in upper:
-                        return True, "Gemini Web Vision: PASSED (API quota fallback)"
-                    if "FAILED" in upper:
-                        return False, "Gemini Web Vision: FAILED (API quota fallback)"
-                self.log.warning("Gemini Web returned no usable response — fail-closed")
-                return False, "Gemini Web: no usable response (fail-closed)"
-            except Exception as we:
-                self.log.error(f"GeminiWebBrowser fallback failed: {we}")
-                return False, f"Gemini Web error (fail-closed): {we}"
+            return self._ask_gemini_web(compressed, reason="API quota hit")
 
         self.log.error(
             f"Gemini failed after {Config.GEMINI_RETRIES + 1} attempt(s) "
             f"(fail-closed): {type(last_exc).__name__}: {last_exc}"
         )
         return False, f"Gemini API error (fail-closed): {last_exc}"
+
+    def _ask_gemini_web(self, compressed: bytes, reason: str = "") -> Tuple[bool, str]:
+        """Ask GeminiWebBrowser and return a (passed, reason_str) tuple."""
+        tag = f" ({reason})" if reason else ""
+        try:
+            response_text, snap = self._gemini_web_browser.ask(
+                self._GEMINI_PROMPT,
+                image_bytes=compressed,
+            )
+            if snap and self._notifier:
+                try:
+                    self._notifier.send_photo(
+                        snap,
+                        caption=f"🌐 <b>Gemini Web Vision Check</b>{tag}",
+                    )
+                except Exception as se:
+                    self.log.warning(f"Could not send Gemini Web screenshot: {se}")
+            if response_text:
+                upper = response_text.upper()
+                if "PASSED" in upper:
+                    return True, f"Gemini Web Vision: PASSED{tag}"
+                if "FAILED" in upper:
+                    return False, f"Gemini Web Vision: FAILED{tag}"
+            self.log.warning("Gemini Web returned no usable response — fail-closed")
+            return False, f"Gemini Web: no usable response (fail-closed){tag}"
+        except Exception as we:
+            self.log.error(f"GeminiWebBrowser fallback failed: {we}")
+            return False, f"Gemini Web error (fail-closed): {we}"
 
     # ── Startup self-test ────────────────────────────────────────────────────
 
