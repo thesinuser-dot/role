@@ -282,46 +282,132 @@ class GeminiWebBrowser:
         return False
 
     def _paste_image_into_gemini(self, image_bytes: bytes) -> bool:
+        import base64 as _b64
         tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
         tmp_path = tmp.name
         tmp.close()
         try:
-            clipboard_ok = self._put_image_on_clipboard(image_bytes, tmp_path)
             page = self._page
 
+            # ── Layer 1: xclip clipboard + Ctrl+V ────────────────────────────
+            clipboard_ok = self._put_image_on_clipboard(image_bytes, tmp_path)
             if clipboard_ok:
-                for sel in [
+                _INPUT_SELS = [
                     "rich-textarea div[contenteditable='true']",
                     "div[contenteditable='true'][role='textbox']",
+                    "div.ql-editor[contenteditable='true']",
                     "textarea[placeholder]",
                     "div[contenteditable='true']",
-                ]:
+                ]
+                for sel in _INPUT_SELS:
                     try:
-                        el = page.wait_for_selector(sel, timeout=8_000)
+                        el = page.wait_for_selector(sel, timeout=5_000)
                         if el and el.is_visible():
                             el.click()
-                            time.sleep(0.4)
+                            time.sleep(0.3)
                             page.keyboard.press("Control+v")
                             time.sleep(2)
+                            # Verify something was actually pasted (image chip appears)
+                            try:
+                                page.wait_for_selector(
+                                    "img[src^='blob:'], [data-test-id='image-chip'], "
+                                    ".image-chip, [aria-label*='image' i]",
+                                    timeout=3_000,
+                                )
+                            except Exception:
+                                pass  # best-effort verification
                             log.info("Reel screenshot pasted via Ctrl+V ✅")
                             return True
                     except Exception:
                         continue
 
-            # Fallback: file input
-            log.info("Clipboard paste failed — trying file-input upload...")
-            for sel in ["input[type='file']", "[data-testid='file-upload']"]:
-                try:
-                    el = page.query_selector(sel)
-                    if el:
-                        el.set_input_files(tmp_path)
-                        log.info(f"Image uploaded via file input ({sel}) ✅")
-                        time.sleep(2)
-                        return True
-                except Exception:
-                    continue
+            # ── Layer 2: JS clipboard API injection ───────────────────────────
+            # Inject the image directly into the page clipboard via JS so the
+            # browser's own paste handler picks it up — works even when xclip
+            # isn't installed or the X11 clipboard is sandboxed.
+            log.info("Clipboard paste failed — trying JS clipboard injection...")
+            try:
+                b64 = _b64.b64encode(image_bytes).decode()
+                injected = page.evaluate(f"""async () => {{
+                    try {{
+                        const b64 = "{b64}";
+                        const bin = atob(b64);
+                        const arr = new Uint8Array(bin.length);
+                        for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+                        const blob = new Blob([arr], {{type: "image/png"}});
+                        await navigator.clipboard.write([
+                            new ClipboardItem({{"image/png": blob}})
+                        ]);
+                        return true;
+                    }} catch(e) {{ return false; }}
+                }}""")
+                if injected:
+                    for sel in [
+                        "rich-textarea div[contenteditable='true']",
+                        "div[contenteditable='true'][role='textbox']",
+                        "div[contenteditable='true']",
+                    ]:
+                        try:
+                            el = page.wait_for_selector(sel, timeout=5_000)
+                            if el and el.is_visible():
+                                el.click()
+                                time.sleep(0.3)
+                                page.keyboard.press("Control+v")
+                                time.sleep(2)
+                                log.info("Reel screenshot pasted via JS clipboard injection ✅")
+                                return True
+                        except Exception:
+                            continue
+            except Exception as js_exc:
+                log.debug(f"JS clipboard injection failed: {js_exc}")
 
-            log.warning("Could not paste or upload image to Gemini.")
+            # ── Layer 3: hidden file input (set_input_files bypasses visibility) ─
+            log.info("JS clipboard failed — trying file input upload...")
+            try:
+                # Try ALL input[type=file] elements, including hidden ones.
+                # Playwright's set_input_files works on hidden inputs directly.
+                all_inputs = page.query_selector_all("input[type='file']")
+                for inp in all_inputs:
+                    try:
+                        inp.set_input_files(tmp_path)
+                        time.sleep(2)
+                        log.info("Image uploaded via hidden file input ✅")
+                        return True
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            # ── Layer 4: click attachment button, then set file input ──────────
+            log.info("Trying attachment button click + file input...")
+            try:
+                for btn_sel in [
+                    "button[aria-label*='attach' i]",
+                    "button[aria-label*='upload' i]",
+                    "button[aria-label*='image' i]",
+                    "button[data-test-id*='attach' i]",
+                    "[role='button'][aria-label*='attach' i]",
+                ]:
+                    try:
+                        btn = page.query_selector(btn_sel)
+                        if btn:
+                            btn.click()
+                            time.sleep(1)
+                            all_inputs = page.query_selector_all("input[type='file']")
+                            for inp in all_inputs:
+                                try:
+                                    inp.set_input_files(tmp_path)
+                                    time.sleep(2)
+                                    log.info(f"Image uploaded via {btn_sel} + file input ✅")
+                                    return True
+                                except Exception:
+                                    continue
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            log.warning("Could not paste or upload image to Gemini after all attempts.")
             return False
         finally:
             try:
