@@ -177,6 +177,7 @@ class TelegramCommandPoller:
         "/startdisplay — raise Chromium window on Xpra desktop\n"
         "   <i>aliases: /desktop  /resumerdp</i>\n"
         "/setviews &lt;n&gt; — set minimum view count\n"
+        "/setlikes &lt;n&gt; — set minimum like count\n"
         "/setscans &lt;n&gt; — set reels-to-scan per run\n"
         "/setsend &lt;n&gt; — set max reels sent per run\n"
         "/skip — stop collecting reels now; proceed to download + Gemini stage\n"
@@ -910,6 +911,7 @@ class InstagramAgent:
             f"  Dedup skipped   : {s_st.dedup}\n"
             f"  DL failures     : {s_st.download_fail}\n\n"
             f"<b>Min Views:</b> {Config.MIN_VIEWS:,}\n"
+            f"<b>Min Likes:</b> {Config.MIN_LIKES:,}\n"
             f"<b>Scan Target:</b> {Config.TARGET_REELS_SCAN}\n"
             f"<b>Max Send:</b> {Config.MAX_QUALIFIED_SEND}\n"
             f"<b>Target accounts:</b> {', '.join(Config.USERS_ATTACK) or '(feed)'}\n"
@@ -969,6 +971,14 @@ class InstagramAgent:
                 reply(f"✅ MIN_VIEWS set to <b>{n:,}</b>")
             except ValueError:
                 reply("❌ Usage: <code>/setviews 50000</code>")
+
+        elif cmd == "/setlikes":
+            try:
+                n = int(arg.replace(",", "").lower().replace("k", "000"))
+                Config.MIN_LIKES = n
+                reply(f"✅ MIN_LIKES set to <b>{n:,}</b>")
+            except ValueError:
+                reply("❌ Usage: <code>/setlikes 150000</code>")
 
         elif cmd == "/setscans":
             try:
@@ -1074,8 +1084,19 @@ class InstagramAgent:
             return
 
         self._poller.start()
+
+        # ── Gemini startup self-test ───────────────────────────────────────
+        gemini_ok, gemini_msg = self.vision.test_gemini()
+        if gemini_ok:
+            self.log.info(f"Gemini self-test PASSED: {gemini_msg}")
+        else:
+            self.log.error(f"Gemini self-test FAILED: {gemini_msg}")
+
         self.notifier.send_message(
             "🤖 <b>Reels Hunter online</b>\n"
+            f"{'✅' if gemini_ok else '❌'} Gemini: {gemini_msg}\n\n"
+            f"⚙️ Views ≥ <b>{Config.MIN_VIEWS:,}</b>  |  "
+            f"Likes ≥ <b>{Config.MIN_LIKES:,}</b>\n"
             "Type /help for available commands.\n"
             "Starting initial hunt..."
         )
