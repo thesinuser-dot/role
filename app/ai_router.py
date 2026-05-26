@@ -27,6 +27,11 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     genai = None
 
+try:
+    from gemini_web import GeminiWebClient as _GeminiWebClient
+except Exception:
+    _GeminiWebClient = None
+
 
 class AIProviderRouter:
     def __init__(self) -> None:
@@ -43,9 +48,30 @@ class AIProviderRouter:
                 self.log.warning("Gemini init failed: %s", exc)
                 self._gemini_model = None
 
+        # Gemini Web — browser-based fallback via GEMINI_COOKIES
+        self._gemini_web: Optional["_GeminiWebClient"] = None
+        if (
+            Config.GEMINI_WEB_ENABLED
+            and Config.GEMINI_COOKIES
+            and _GeminiWebClient is not None
+        ):
+            try:
+                self._gemini_web = _GeminiWebClient(Config.GEMINI_COOKIES)
+                if self._gemini_web.enabled:
+                    self.log.info("Gemini Web (browser) provider ready.")
+                else:
+                    self._gemini_web = None
+            except Exception as exc:
+                self.log.warning("Gemini Web init failed: %s", exc)
+                self._gemini_web = None
+
     @property
     def gemini_ready(self) -> bool:
         return self._gemini_model is not None
+
+    @property
+    def gemini_web_ready(self) -> bool:
+        return self._gemini_web is not None and self._gemini_web.enabled
 
     def _response_text(self, response) -> Optional[str]:
         if response is None:
@@ -236,14 +262,30 @@ class AIProviderRouter:
             except Exception as exc:
                 self.log.warning("Gemini request failed: %s", exc)
 
-        # 2) Text-only fallbacks — ONLY used when there is no image.
+        # 2) Gemini Web — browser-based vision fallback (GEMINI_COOKIES).
+        #    Only tried when the API key is absent/failed AND image is present.
+        if has_image and self._gemini_web is not None:
+            tried.append("gemini_web")
+            try:
+                result = self._gemini_web.complete(
+                    prompt,
+                    image_bytes=image_bytes,
+                    max_output_tokens=max_output_tokens,
+                )
+                if result:
+                    self.log.info("Gemini Web vision succeeded.")
+                    return result
+            except Exception as exc:
+                self.log.warning("Gemini Web request failed: %s", exc)
+
+        # 3) Text-only fallbacks — ONLY used when there is no image.
         #    Groq and OpenRouter do not accept image inputs; using them for a
         #    vision task would silently discard the screenshot and hallucinate.
         if has_image:
             self.log.warning(
                 "Image task: skipping Groq and OpenRouter — "
                 "they are text-only and cannot evaluate screenshots. "
-                "Configure GEMINI_API_KEY or enable Gemini Web fallback."
+                "Configure GEMINI_API_KEY or GEMINI_COOKIES for Gemini Web fallback."
             )
             return None
 
