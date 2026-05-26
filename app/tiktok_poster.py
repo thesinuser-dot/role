@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import time
 import tempfile
 from pathlib import Path
@@ -138,7 +139,9 @@ class TikTokPoster:
     def __init__(self) -> None:
         self.enabled: bool = Config.TIKTOK_ENABLED
         self._cookies_path: Optional[Path] = None
-        self._temp_cookies: Optional[Path] = None  # auto-generated; cleaned up on del
+        self._temp_cookies: Optional[Path] = None  # auto-generated; cleaned up on close
+        self._auth_mode: str = Config.TIKTOK_AUTH_MODE
+        self._cleanup_done: bool = False
 
         if not self.enabled:
             log.info("TikTok posting disabled (TIKTOK_ENABLED=false).")
@@ -155,15 +158,15 @@ class TikTokPoster:
         # Auto-switch to session mode if TIKTOK_SESSION_COOKIES is set
         # and the user hasn't explicitly chosen a mode.
         if (
-            Config.TIKTOK_SESSION_COOKIES.strip()
-            and Config.TIKTOK_AUTH_MODE == "cookies"
+            (Config.TIKTOK_SESSION_COOKIES.strip() or Config.TIKTOK_SESSION_ID.strip())
+            and self._auth_mode == "cookies"
             and not Path(Config.TIKTOK_COOKIES_FILE).exists()
         ):
             log.info(
-                "TIKTOK_SESSION_COOKIES is set and no cookies file found — "
+                "Session cookie value is set and no cookies file found — "
                 "switching to session auth mode automatically."
             )
-            Config.TIKTOK_AUTH_MODE = "session"
+            self._auth_mode = "session"
 
         self._cookies_path = self._resolve_cookies()
         if not self._cookies_path:
@@ -176,12 +179,18 @@ class TikTokPoster:
             return
 
         log.info(
-            f"TikTokPoster ready (auth_mode={Config.TIKTOK_AUTH_MODE}, "
+            f"TikTokPoster ready (auth_mode={self._auth_mode}, "
             f"cookies={self._cookies_path})"
         )
 
     def __del__(self) -> None:
-        # Clean up auto-generated cookies file.
+        self.close()
+
+    def close(self) -> None:
+        # Clean up auto-generated cookies file explicitly.
+        if self._cleanup_done:
+            return
+        self._cleanup_done = True
         if self._temp_cookies and self._temp_cookies.exists():
             try:
                 self._temp_cookies.unlink()
@@ -191,12 +200,12 @@ class TikTokPoster:
     # ── Auth ──────────────────────────────────────────────────────────────────
 
     def _resolve_cookies(self) -> Optional[Path]:
-        mode = Config.TIKTOK_AUTH_MODE.lower()
+        mode = self._auth_mode.lower()
 
         if mode == "session":
-            raw = Config.TIKTOK_SESSION_COOKIES.strip()
+            raw = (Config.TIKTOK_SESSION_COOKIES or Config.TIKTOK_SESSION_ID).strip()
             if not raw:
-                log.error("TIKTOK_AUTH_MODE=session but TIKTOK_SESSION_COOKIES is empty.")
+                log.error("TIKTOK_AUTH_MODE=session but TIKTOK_SESSION_COOKIES/TIKTOK_SESSION_ID is empty.")
                 return None
             session_id = _extract_session_id(raw)
             if not session_id:
@@ -217,6 +226,51 @@ class TikTokPoster:
             log.error(f"TIKTOK_COOKIES_FILE not found: {cookies_path}")
             return None
         return cookies_path
+
+    def _upload_with_timeout(self, video_path: Path, caption: str) -> None:
+        """Run upload_video with a hard timeout on Unix-like systems."""
+        if Config.TIKTOK_UPLOAD_TIMEOUT_SECONDS <= 0:
+            upload_video(
+                filename=str(video_path),
+                description=caption,
+                cookies=str(self._cookies_path),
+                headless=Config.TIKTOK_HEADLESS,
+                schedule=None,
+            )
+            return
+
+        if not hasattr(signal, "SIGALRM"):
+            upload_video(
+                filename=str(video_path),
+                description=caption,
+                cookies=str(self._cookies_path),
+                headless=Config.TIKTOK_HEADLESS,
+                schedule=None,
+            )
+            return
+
+        class _UploadTimeout(Exception):
+            pass
+
+        def _handler(_signum, _frame):
+            raise _UploadTimeout("TikTok upload timed out")
+
+        old_handler = signal.signal(signal.SIGALRM, _handler)
+        try:
+            signal.setitimer(signal.ITIMER_REAL, float(Config.TIKTOK_UPLOAD_TIMEOUT_SECONDS))
+            upload_video(
+                filename=str(video_path),
+                description=caption,
+                cookies=str(self._cookies_path),
+                headless=Config.TIKTOK_HEADLESS,
+                schedule=None,
+            )
+        finally:
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+            except Exception:
+                pass
+            signal.signal(signal.SIGALRM, old_handler)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -249,14 +303,7 @@ class TikTokPoster:
                     f"[TikTok] Upload attempt {attempt}/{Config.TIKTOK_MAX_RETRIES} "
                     f"— {video_path.name}"
                 )
-                upload_video(
-                    filename=str(video_path),
-                    description=caption,
-                    cookies=str(self._cookies_path),
-                    headless=Config.TIKTOK_HEADLESS,
-                    # Schedule for immediate publish (no schedule = post now)
-                    schedule=None,
-                )
+                self._upload_with_timeout(video_path, caption)
                 log.info(f"[TikTok] ✅ Upload succeeded: {video_path.name}")
                 return True
 
