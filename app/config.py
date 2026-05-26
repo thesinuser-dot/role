@@ -25,6 +25,21 @@ class Config:
     GEMINI_MAX_DIM: int = int(os.environ.get("GEMINI_MAX_DIM", "720"))
     # How many times to retry a transient Gemini error before failing closed
     GEMINI_RETRIES: int = int(os.environ.get("GEMINI_RETRIES", "2"))
+
+    # ── Text / hashtag providers ───────────────────────────────────────────────
+    # Provider order is automatic by default: first configured provider wins.
+    AI_PROVIDER_ORDER: List[str] = [
+        p.strip().lower()
+        for p in os.environ.get("AI_PROVIDER_ORDER", "gemini,groq,openrouter")
+        .split(",")
+        if p.strip()
+    ]
+    GROQ_API_KEY: str = os.environ.get("GROQ_API_KEY", "")
+    GROQ_MODEL: str = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+    OPENROUTER_API_KEY: str = os.environ.get("OPENROUTER_API_KEY", "")
+    # OpenRouter's free router automatically picks a currently available free model.
+    OPENROUTER_MODEL: str = os.environ.get("OPENROUTER_MODEL", "openrouter/free")
+    OPENROUTER_APP_NAME: str = os.environ.get("OPENROUTER_APP_NAME", "Reels Hunter")
     
     # ── Gemini Fallback Mode (when API quota/limit is hit) ────────────────────
     # When True, if Gemini API fails due to quota/limits, fall back to using 
@@ -55,12 +70,16 @@ class Config:
     # Accepts either a bare sessionid value ("abc123") or a full cookie string
     # ("sessionid=abc123; tt_csrf_token=xyz; ...") — both are handled.
     TIKTOK_SESSION_COOKIES: str = os.environ.get("TIKTOK_SESSION_COOKIES", "")
+    # Backwards-compatible alias for older docs/scripts.
+    TIKTOK_SESSION_ID: str = os.environ.get("TIKTOK_SESSION_ID", "")
 
     # Run the upload browser headlessly (True) or visibly (False for debugging)
     TIKTOK_HEADLESS: bool = os.environ.get("TIKTOK_HEADLESS", "true").strip().lower() == "true"
 
     # Retry budget for failed uploads within a single run
     TIKTOK_MAX_RETRIES: int = int(os.environ.get("TIKTOK_MAX_RETRIES", "2"))
+    # Hard guard for uploads that hang on the page automation layer
+    TIKTOK_UPLOAD_TIMEOUT_SECONDS: int = int(os.environ.get("TIKTOK_UPLOAD_TIMEOUT_SECONDS", "240"))
 
     # Caption template — use {url}, {views}, {likes}, {tags} placeholders.
     # Leave empty for the default short-caption mode.
@@ -175,6 +194,11 @@ class Config:
             f"|  DB path            : {cls.DB_PATH}",
             f"|  Gemini model       : {cls.GEMINI_MODEL}",
             f"|  Gemini enabled     : {bool(cls.GEMINI_API_KEY)}",
+            f"|  Groq model         : {cls.GROQ_MODEL}",
+            f"|  Groq enabled       : {bool(cls.GROQ_API_KEY)}",
+            f"|  OpenRouter model   : {cls.OPENROUTER_MODEL}",
+            f"|  OpenRouter enabled : {bool(cls.OPENROUTER_API_KEY)}",
+            f"|  Provider order     : {', '.join(cls.AI_PROVIDER_ORDER)}",
             f"|  Gemini fallback    : {cls.ENABLE_GEMINI_FALLBACK}",
             f"|  Fallback min views : {cls.FALLBACK_MIN_VIEWS:,}",
             f"|  Fallback min likes : {cls.FALLBACK_MIN_LIKES:,}",
