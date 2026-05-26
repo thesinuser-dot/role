@@ -468,17 +468,12 @@ class VisionEvaluator:
         return result
 
     def evaluate(self, screenshot_bytes: bytes, views: int = 0, likes: int = 0) -> Tuple[bool, str]:
-        self.log.info("Vision Stage 1: local border pixel analysis")
-        ok, reason = self.check_aspect_ratio_local(screenshot_bytes)
-        if not ok:
-            self.log.warning(f"Stage 1 FAILED: {reason}")
-            return False, reason
-        self.log.info(f"Stage 1 PASSED: {reason}")
-
-        self.log.info("Vision Stage 2: Gemini multimodal evaluation")
+        # Black-bar / pixel Stage 1 removed — cinematic edits legitimately have
+        # letterboxing and must NOT be rejected for it. Only Gemini decides.
+        self.log.info("Vision: Gemini-only evaluation (black bar check removed)")
         ok, reason = self.check_with_gemini(screenshot_bytes, views, likes)
         if not ok:
-            self.log.warning(f"Stage 2 FAILED: {reason}")
+            self.log.warning(f"Vision FAILED: {reason}")
             return False, reason
-        self.log.info(f"Stage 2 PASSED: {reason}")
-        return True, "All vision checks passed"
+        self.log.info(f"Vision PASSED: {reason}")
+        return True, "Gemini vision passed"
