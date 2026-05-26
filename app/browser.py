@@ -232,6 +232,21 @@ class BrowserManager:
     # ── Cookie helpers ────────────────────────────────────────────────────────
 
     @staticmethod
+    def _sanitize_same_site(value: str) -> str:
+        """
+        Playwright only accepts 'Strict', 'Lax', or 'None'.
+        Browser exports use values like 'no_restriction', 'strict', 'lax', etc.
+        """
+        if not value:
+            return "None"
+        v = value.lower().replace("_", "").replace("-", "")
+        if v in ("strict",):
+            return "Strict"
+        if v in ("lax",):
+            return "Lax"
+        return "None"  # 'no_restriction', 'unspecified', anything else → None
+
+    @staticmethod
     def _parse_cookies(raw: str) -> List[dict]:
         """
         Accept either a JSON array (from EditThisCookie export) or a
@@ -263,6 +278,9 @@ class BrowserManager:
                     cookie["path"]     = c.get("path", "/")
                     cookie["secure"]   = c.get("secure", True)
                     cookie["httpOnly"] = c.get("httpOnly", False)
+                    cookie["sameSite"] = BrowserManager._sanitize_same_site(
+                        c.get("sameSite", c.get("same_site", "None"))
+                    )
                     exp = c.get("expirationDate", c.get("expires", 2147483647))
                     try:
                         cookie["expires"] = int(float(exp)) if exp else 2147483647
