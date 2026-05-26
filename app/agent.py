@@ -770,6 +770,7 @@ class InstagramAgent:
             reel_urls = self.collector.collect_reel_urls(
                 self.notifier,
                 stop_fn=lambda: self._skip_collection,
+                drain_fn=lambda: self._drain_cmd_queue(defer_hunt_cmds=True),
             )
             self._skip_collection = False
             if not reel_urls:
@@ -813,6 +814,11 @@ class InstagramAgent:
                 )
                 self.wq.enqueue_task(task)
                 self._process_task(task, run_stats)
+
+                # Drain commands immediately after each task so /status /skip
+                # etc. are handled as soon as the reel finishes, not at the
+                # start of the next iteration.
+                self._drain_cmd_queue(defer_hunt_cmds=True)
 
                 if task.status == ReelStatus.RETRY:
                     self.wq.enqueue_retry(task)
