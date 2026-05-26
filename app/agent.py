@@ -175,6 +175,7 @@ class TelegramCommandPoller:
         "/status — current run state &amp; uptime\n"
         "/stats — all-time DB statistics\n"
         "/test &lt;url&gt; — force-download one reel (skips AI &amp; dedup)\n"
+        "/post &lt;url&gt; — download reel MP4 &amp; post directly to TikTok (skips stats &amp; AI check)\n"
         "/startdisplay — raise Chromium window on Xpra desktop\n"
         "   <i>aliases: /desktop  /resumerdp</i>\n"
         "/setviews &lt;n&gt; — set minimum view count\n"
@@ -315,6 +316,11 @@ class InstagramAgent:
         self.notifier = NotificationService(Config.TELEGRAM_BOT_TOKEN, Config.TELEGRAM_CHAT_ID)
         self.tiktok   = TikTokPoster()
         self.wq       = WorkQueue()
+
+        # Give vision access to the notifier so Gemini Web screenshots go to Telegram
+        self.vision._notifier = self.notifier
+        if getattr(self.vision, '_gemini_web_browser', None):
+            self.vision._gemini_web_browser.set_notifier(self.notifier)
 
         self.collector: Optional[ReelCollector] = None
 
@@ -775,7 +781,7 @@ class InstagramAgent:
                 break
 
             cmd = item["cmd"]
-            if defer_hunt_cmds and cmd in ("__hunt__", "__test__", "__testsetup__"):
+            if defer_hunt_cmds and cmd in ("__hunt__", "__test__", "__testsetup__", "__post__"):
                 deferred.append(item)
                 continue
 
@@ -966,6 +972,84 @@ class InstagramAgent:
             self.log.error(f"Test setup exception:\n{tb}")
             self._poller.reply(f"❌ Test setup crashed:\n<pre>{tb[:400]}</pre>")
 
+    # ── /post <URL>: download reel & post to TikTok directly ─────────────────
+
+    def _run_post(self, url: str) -> None:
+        """
+        Download a reel from *url* and post it straight to TikTok.
+        Skips all stats checks (views/likes) and AI vision checks.
+        The browser navigates to the URL, downloads the MP4, then TikTok
+        uploader runs (visible browser) to post it.
+        """
+        self.log.info(f"/post MODE: {url}")
+        self._poller.reply(
+            f"⬇️ <b>/post received</b> — downloading reel and posting to TikTok...\n"
+            f"<code>{url}</code>\n"
+            "⚠️ All stats &amp; AI checks are SKIPPED."
+        )
+
+        reel_id = ReelCollector.extract_reel_id(url)
+        if not reel_id:
+            self._poller.reply("❌ Cannot parse reel ID from that URL.")
+            return
+
+        page: Page = self.bm.page
+
+        # Navigate to the reel so browser-based download strategy can work
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+            self.bm.delay(2000, 4000)
+            self.collector.dismiss_popups()
+        except Exception as exc:
+            self._poller.reply(f"❌ Navigation failed: {exc}")
+            return
+
+        # Take a screenshot so the user can see what we're posting
+        try:
+            snap = _capture_reel_screenshot(page, reel_id)
+            if snap and self._notifier:
+                self.notifier.send_photo(
+                    snap,
+                    caption=f"📸 Reel to post to TikTok:\n<code>{url}</code>",
+                )
+        except Exception as exc:
+            self.log.warning(f"[/post] Screenshot failed (non-fatal): {exc}")
+
+        # Download
+        self.log.info(f"[/post][{reel_id}] Downloading...")
+        self._poller.reply(f"⬇️ Downloading <code>{reel_id}</code>...")
+        video_path, strategy = download_reel(url, reel_id, page=page)
+
+        if not video_path:
+            self._poller.reply(f"❌ Download failed for <code>{reel_id}</code> — all strategies exhausted.")
+            return
+
+        self.log.info(f"[/post][{reel_id}] Downloaded via strategy={strategy}")
+        self._poller.reply(f"✅ Downloaded (strategy={strategy}) — posting to TikTok now...")
+
+        # Post to TikTok
+        if not self.tiktok.enabled:
+            self._poller.reply(
+                "⚠️ TikTok posting is disabled (TIKTOK_ENABLED=false).\n"
+                "Set the env var to enable it."
+            )
+            return
+
+        tiktok_ok = self.tiktok.post(video_path, url, views=0, likes=0, extra_tags=[])
+
+        if tiktok_ok:
+            self._poller.reply(f"✅ <b>Posted to TikTok!</b>\nReel: <code>{url}</code>")
+            self.log.info(f"[/post][{reel_id}] ✅ TikTok post succeeded.")
+        else:
+            self._poller.reply(f"❌ TikTok post failed for <code>{reel_id}</code>.")
+            self.log.error(f"[/post][{reel_id}] TikTok post failed.")
+
+        # Clean up local file
+        try:
+            video_path.unlink(missing_ok=True)
+        except OSError as exc:
+            self.log.warning(f"[/post] Could not delete local file: {exc}")
+
     # ── Command dispatch ──────────────────────────────────────────────────────
 
     def _get_status_text(self) -> str:
@@ -1052,6 +1136,21 @@ class InstagramAgent:
                 reply("⚠️ A hunt is running. /testsetup will run after it finishes.")
             reply(f"🧪 Test setup queued:\n<code>{url}</code>")
             self._cmd_queue.put({"cmd": "__testsetup__", "arg": url})
+
+        elif cmd == "/post":
+            url = arg.strip()
+            if not url:
+                reply("❌ Usage: <code>/post https://www.instagram.com/reel/XXXXX/</code>")
+                return
+            if "/reel" not in url and "/p/" not in url:
+                reply(
+                    "❌ URL doesn't look like an Instagram reel.\n"
+                    "Accepted: <code>/reel/XXXXX/</code>  or  <code>/p/XXXXX/</code>"
+                )
+                return
+            if self._hunting:
+                reply("⚠️ A hunt is running. /post will run after it finishes.")
+            self._cmd_queue.put({"cmd": "__post__", "arg": url})
 
         elif cmd == "/setviews":
             try:
@@ -1238,6 +1337,16 @@ class InstagramAgent:
                         tb = traceback.format_exc()
                         self.log.error(f"Test setup exception:\n{tb}")
                         self._poller.reply(f"❌ Test setup crashed:\n<pre>{tb[:400]}</pre>")
+
+                elif cmd == "__post__":
+                    try:
+                        self._run_post(arg)
+                    except KeyboardInterrupt:
+                        raise
+                    except Exception:
+                        tb = traceback.format_exc()
+                        self.log.error(f"/post exception:\n{tb}")
+                        self._poller.reply(f"❌ /post crashed:\n<pre>{tb[:400]}</pre>")
 
                 else:
                     try:
