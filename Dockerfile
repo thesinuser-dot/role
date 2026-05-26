@@ -90,8 +90,8 @@ RUN playwright install-deps chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium-browser
 
 # ── Application source ─────────────────────────────────────────────────────────
-COPY agent.py       /app/agent.py
-COPY entrypoint.sh  /app/entrypoint.sh
+COPY app/             /app/
+COPY entrypoint.sh    /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 # ── Runtime directories ────────────────────────────────────────────────────────
