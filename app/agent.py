@@ -226,9 +226,9 @@ class TelegramCommandPoller:
             resp = requests.get(
                 f"{self.base_url}/getUpdates",
                 params={
-                    "offset": self._offset,
-                    "timeout": 20,
-                    "allowed_updates": ["message"],
+                    "offset":          self._offset,
+                    "timeout":         20,
+                    "allowed_updates": ["message", "callback_query"],
                 },
                 timeout=30,
             )
