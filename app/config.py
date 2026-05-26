@@ -1,264 +1,271 @@
 #!/usr/bin/env python3
 # ─────────────────────────────────────────────────────────────────────────────
-# config.py — Central configuration
-# All values are read from environment variables; hard defaults make the agent
-# runnable without any env vars for local testing.
+# gemini_web_browser.py — Visible Playwright browser for Gemini Web fallback
+#
+# Triggered automatically when GEMINI_API_KEY is not set (or quota-exhausted).
+# Opens a VISIBLE Chromium window (headless=False) so the user can see it,
+# navigates to gemini.google.com, types the prompt, takes a screenshot of the
+# response, then sends the screenshot to Telegram.
+#
+# The text response is also returned so vision.py / ai_router.py can use it.
 # ─────────────────────────────────────────────────────────────────────────────
 
-import os
+from __future__ import annotations
+
+import logging
+import time
+import json
+import base64
+from io import BytesIO
 from pathlib import Path
-from typing import List
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    pass
+
+log = logging.getLogger("GeminiWebBrowser")
 
 
-class Config:
-    # ── Instagram ──────────────────────────────────────────────────────────────
-    INSTAGRAM_SESSION_COOKIES: str = os.environ.get("INSTAGRAM_SESSION_COOKIES", "")
-    INSTAGRAM_REELS_URL: str = "https://www.instagram.com/reels/"
+class GeminiWebBrowser:
+    """
+    Opens a visible Chromium window, goes to gemini.google.com,
+    injects cookies (if provided), types the prompt, waits for the response,
+    takes a screenshot and returns the response text + screenshot bytes.
 
-    # ── Viral thresholds ───────────────────────────────────────────────────────
-    MIN_VIEWS: int = int(os.environ.get("MIN_VIEWS", "0"))
-    MIN_LIKES: int = int(os.environ.get("MIN_LIKES", "150000"))
+    headless is always False — the user can watch it work.
+    """
 
-    # ── Gemini vision ──────────────────────────────────────────────────────────
-    GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
-    GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
-    GEMINI_MAX_DIM: int = int(os.environ.get("GEMINI_MAX_DIM", "720"))
-    # How many times to retry a transient Gemini error before failing closed
-    GEMINI_RETRIES: int = int(os.environ.get("GEMINI_RETRIES", "2"))
+    GEMINI_URL = "https://gemini.google.com/app"
 
-    # ── Gemini Web fallback (browser-based, no API key needed) ────────────────
-    # Paste Google account cookies (JSON array or semicolon-separated) so the
-    # agent can query gemini.google.com directly when the API key is absent or
-    # quota-exhausted.
-    GEMINI_COOKIES: str = os.environ.get("GEMINI_COOKIES", "")
-    # Enable Gemini Web as a vision provider when API key is unavailable
-    GEMINI_WEB_ENABLED: bool = os.environ.get("GEMINI_WEB_ENABLED", "true").strip().lower() == "true"
+    def __init__(self, cookies_raw: str = ""):
+        from config import Config
+        self._cookies_raw = cookies_raw
+        self._notifier = None  # injected by caller if needed
+        self._screenshot_dir = Config.SCREENSHOT_DIR
 
-    # ── Human approval (Telegram inline buttons) ──────────────────────────────
-    # When True, each reel that passes AI vision is sent as a screenshot to
-    # Telegram with ✅ Approve and ⏭ Skip buttons before downloading.
-    # When False (default), reels are downloaded and sent automatically.
-    HUMAN_APPROVAL_ENABLED: bool = os.environ.get("HUMAN_APPROVAL_ENABLED", "false").strip().lower() == "true"
-    # Seconds to wait for a human response before auto-approving or auto-skipping
-    HUMAN_APPROVAL_TIMEOUT_S: int = int(os.environ.get("HUMAN_APPROVAL_TIMEOUT_S", "120"))
-    # What to do when the timeout expires with no response: "approve" or "skip"
-    HUMAN_APPROVAL_TIMEOUT_ACTION: str = os.environ.get("HUMAN_APPROVAL_TIMEOUT_ACTION", "approve").strip().lower()
+    def set_notifier(self, notifier) -> None:
+        """Inject the Telegram notifier so screenshots can be forwarded."""
+        self._notifier = notifier
 
-    # ── Text / hashtag providers ───────────────────────────────────────────────
-    # Provider order is automatic by default: first configured provider wins.
-    AI_PROVIDER_ORDER: List[str] = [
-        p.strip().lower()
-        for p in os.environ.get("AI_PROVIDER_ORDER", "gemini,groq,openrouter")
-        .split(",")
-        if p.strip()
-    ]
-    GROQ_API_KEY: str = os.environ.get("GROQ_API_KEY", "")
-    # Auto-cascade through best free Groq/LLaMA models — fastest available wins.
-    # Override with GROQ_MODEL env var if you want a specific model.
-    GROQ_MODEL: str = os.environ.get("GROQ_MODEL", "auto")
-    # Ordered list of best free Groq models (tried in order, first success wins).
-    GROQ_MODEL_CASCADE: List[str] = [
-        m.strip()
-        for m in os.environ.get(
-            "GROQ_MODEL_CASCADE",
-            "llama-3.3-70b-versatile,"
-            "llama-3.1-70b-versatile,"
-            "llama3-70b-8192,"
-            "llama-3.1-8b-instant,"
-            "llama3-8b-8192,"
-            "gemma2-9b-it",
-        ).split(",")
-        if m.strip()
-    ]
-    OPENROUTER_API_KEY: str = os.environ.get("OPENROUTER_API_KEY", "")
-    # "auto" = use OpenRouter's free model router (always picks something available).
-    # Override with OPENROUTER_MODEL env var for a specific model.
-    OPENROUTER_MODEL: str = os.environ.get("OPENROUTER_MODEL", "auto")
-    # Best free OpenRouter models tried in order (fallback cascade).
-    OPENROUTER_MODEL_CASCADE: List[str] = [
-        m.strip()
-        for m in os.environ.get(
-            "OPENROUTER_MODEL_CASCADE",
-            "meta-llama/llama-3.3-70b-instruct:free,"
-            "meta-llama/llama-3.1-8b-instruct:free,"
-            "mistralai/mistral-7b-instruct:free,"
-            "google/gemma-2-9b-it:free,"
-            "qwen/qwen2.5-72b-instruct:free",
-        ).split(",")
-        if m.strip()
-    ]
-    OPENROUTER_APP_NAME: str = os.environ.get("OPENROUTER_APP_NAME", "Reels Hunter")
-    
-    # ── Gemini Fallback Mode (when API quota/limit is hit) ────────────────────
-    # When True, if Gemini API fails due to quota/limits, fall back to using 
-    # views/likes metrics to determine quality instead of rejecting the reel
-    ENABLE_GEMINI_FALLBACK: bool = os.environ.get("ENABLE_GEMINI_FALLBACK", "true").strip().lower() == "true"
-    # Minimum views required when falling back (if Gemini unavailable)
-    FALLBACK_MIN_VIEWS: int = int(os.environ.get("FALLBACK_MIN_VIEWS", "500000"))
-    # Minimum likes required when falling back (if Gemini unavailable)
-    FALLBACK_MIN_LIKES: int = int(os.environ.get("FALLBACK_MIN_LIKES", "250000"))
+    def _parse_cookies(self) -> list[dict]:
+        """
+        Parse GEMINI_COOKIES — supports:
+          - JSON array of {name, value, domain, ...} dicts
+          - Semicolon-separated key=value pairs (converted to .google.com cookies)
+        """
+        raw = self._cookies_raw.strip()
+        if not raw:
+            return []
+        # Try JSON array first
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return parsed
+        except (json.JSONDecodeError, ValueError):
+            pass
+        # Fall back to semicolon-separated key=value string
+        cookies = []
+        for part in raw.replace(";", "\n").splitlines():
+            part = part.strip()
+            if "=" in part:
+                k, v = part.split("=", 1)
+                cookies.append({
+                    "name": k.strip(),
+                    "value": v.strip(),
+                    "domain": ".google.com",
+                    "path": "/",
+                    "httpOnly": False,
+                    "secure": True,
+                })
+        return cookies
 
-    # ── Telegram ───────────────────────────────────────────────────────────────
-    TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    TELEGRAM_CHAT_ID: str = os.environ.get("TELEGRAM_CHAT_ID", "")
-    TELEGRAM_API_BASE: str = "https://api.telegram.org/bot"
-    TELEGRAM_MAX_VIDEO_MB: int = int(os.environ.get("TELEGRAM_MAX_VIDEO_MB", "49"))
+    def ask(
+        self,
+        prompt: str,
+        image_bytes: Optional[bytes] = None,
+        timeout_ms: int = 60_000,
+    ) -> tuple[Optional[str], Optional[bytes]]:
+        """
+        Open a visible Gemini browser, send the prompt (optionally with an
+        image), wait for the response, capture a screenshot, send it to
+        Telegram, and return (response_text, screenshot_bytes).
 
-    # ── TikTok ────────────────────────────────────────────────────────────────
-    # Set TIKTOK_ENABLED=true to activate auto-posting after each Telegram send.
-    TIKTOK_ENABLED: bool = os.environ.get("TIKTOK_ENABLED", "false").strip().lower() == "true"
+        Returns (None, None) on failure.
+        """
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            log.error("playwright not installed — Gemini Web Browser unavailable.")
+            return None, None
 
-    # Auth mode: "cookies" (default) or "session"
-    #   cookies  — point TIKTOK_COOKIES_FILE at a Netscape cookies.txt you
-    #              exported from a logged-in browser session.
-    #   session  — paste the raw `sessionid` cookie value (or full cookie
-    #              string) into TIKTOK_SESSION_COOKIES.
-    TIKTOK_AUTH_MODE: str = os.environ.get("TIKTOK_AUTH_MODE", "cookies").strip().lower()
-    TIKTOK_COOKIES_FILE: str = os.environ.get("TIKTOK_COOKIES_FILE", os.path.expanduser("~/.secrets/tiktok_cookies.txt"))
-    # Accepts either a bare sessionid value ("abc123") or a full cookie string
-    # ("sessionid=abc123; tt_csrf_token=xyz; ...") — both are handled.
-    TIKTOK_SESSION_COOKIES: str = os.environ.get("TIKTOK_SESSION_COOKIES", "")
-    # Backwards-compatible alias for older docs/scripts.
-    TIKTOK_SESSION_ID: str = os.environ.get("TIKTOK_SESSION_ID", "")
+        from config import Config
 
-    # Run the upload browser headlessly (True) or visibly (False for debugging)
-    TIKTOK_HEADLESS: bool = os.environ.get("TIKTOK_HEADLESS", "true").strip().lower() == "true"
+        log.info("🌐 Opening VISIBLE Gemini browser (headless=False)...")
 
-    # Retry budget for failed uploads within a single run
-    TIKTOK_MAX_RETRIES: int = int(os.environ.get("TIKTOK_MAX_RETRIES", "2"))
-    # Hard guard for uploads that hang on the page automation layer
-    TIKTOK_UPLOAD_TIMEOUT_SECONDS: int = int(os.environ.get("TIKTOK_UPLOAD_TIMEOUT_SECONDS", "240"))
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(
+                    headless=False,  # always visible
+                    args=[
+                        "--no-sandbox",
+                        "--disable-blink-features=AutomationControlled",
+                        "--disable-infobars",
+                    ],
+                )
+                ctx = browser.new_context(
+                    viewport={"width": 1280, "height": 900},
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"
+                    ),
+                    locale="en-US",
+                )
 
-    # Caption template — use {url}, {views}, {likes}, {tags} placeholders.
-    # Leave empty for the default short-caption mode.
-    TIKTOK_CAPTION_TEMPLATE: str = os.environ.get("TIKTOK_CAPTION_TEMPLATE", "")
+                # Inject cookies if provided
+                cookies = self._parse_cookies()
+                if cookies:
+                    ctx.add_cookies(cookies)
+                    log.info(f"Injected {len(cookies)} Gemini cookie(s).")
 
-    # Hashtags appended to every TikTok post (comma-separated)
-    TIKTOK_HASHTAGS: List[str] = [
-        h.strip().lstrip("#")
-        for h in os.environ.get(
-            "TIKTOK_HASHTAGS",
-            "fyp,viral,edit,trending,reels",
-        ).split(",")
-        if h.strip()
-    ]
+                page = ctx.new_page()
+                log.info(f"Navigating to {self.GEMINI_URL} ...")
+                page.goto(self.GEMINI_URL, wait_until="domcontentloaded", timeout=30_000)
+                time.sleep(3)
 
-    # ── Database ───────────────────────────────────────────────────────────────
-    DB_PATH: str = os.environ.get("DB_PATH", "history.db")
+                # ── Upload image if provided ───────────────────────────────
+                if image_bytes:
+                    # Save image to temp file for upload
+                    import tempfile
+                    import os
+                    tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+                    tmp.write(image_bytes)
+                    tmp.close()
+                    tmp_path = tmp.name
 
-    # ── Runtime limits ─────────────────────────────────────────────────────────
-    MAX_RUNTIME_SECONDS: int = int(os.environ.get("MAX_RUNTIME_SECONDS", "480"))
-    SHUTDOWN_BUFFER_SECONDS: int = int(os.environ.get("SHUTDOWN_BUFFER_SECONDS", "45"))
-    TARGET_REELS_SCAN: int = int(os.environ.get("TARGET_REELS_SCAN", "35"))
-    MAX_QUALIFIED_SEND: int = int(os.environ.get("MAX_QUALIFIED_SEND", "5"))
+                    try:
+                        # Try to find file upload button
+                        upload_selectors = [
+                            "input[type='file']",
+                            "[data-testid='file-upload']",
+                            "button[aria-label*='upload']",
+                            "button[aria-label*='image']",
+                            ".file-upload-button",
+                        ]
+                        for sel in upload_selectors:
+                            try:
+                                el = page.query_selector(sel)
+                                if el:
+                                    el.set_input_files(tmp_path)
+                                    log.info(f"Image uploaded via selector: {sel}")
+                                    time.sleep(2)
+                                    break
+                            except Exception:
+                                continue
+                    finally:
+                        try:
+                            os.unlink(tmp_path)
+                        except Exception:
+                            pass
 
-    # ── Retry / queue ──────────────────────────────────────────────────────────
-    # How many times to retry a failed Telegram send (persisted across runs)
-    MAX_UPLOAD_ATTEMPTS: int = int(os.environ.get("MAX_UPLOAD_ATTEMPTS", "3"))
-    # How many times to retry a failed reel download within a single run
-    MAX_DOWNLOAD_ATTEMPTS: int = int(os.environ.get("MAX_DOWNLOAD_ATTEMPTS", "2"))
+                # ── Type the prompt ────────────────────────────────────────
+                input_selectors = [
+                    "rich-textarea div[contenteditable='true']",
+                    "div[contenteditable='true'][role='textbox']",
+                    "div.ql-editor[contenteditable='true']",
+                    "textarea[placeholder]",
+                    "div[contenteditable='true']",
+                ]
+                typed = False
+                for sel in input_selectors:
+                    try:
+                        el = page.wait_for_selector(sel, timeout=10_000)
+                        if el:
+                            el.click()
+                            time.sleep(0.5)
+                            el.type(prompt[:4000], delay=20)
+                            typed = True
+                            log.info(f"Prompt typed via selector: {sel}")
+                            break
+                    except Exception:
+                        continue
 
-    # ── Paths ──────────────────────────────────────────────────────────────────
-    DOWNLOAD_DIR: Path = Path(os.environ.get("DOWNLOAD_DIR", "/tmp/reels_downloads"))
-    SCREENSHOT_DIR: Path = Path(os.environ.get("SCREENSHOT_DIR", "/tmp/reels_screenshots"))
-    COOKIES_FILE: Path = Path("/tmp/ig_cookies.txt")
+                if not typed:
+                    log.error("Could not find Gemini prompt input field.")
+                    snap = page.screenshot(type="jpeg", quality=80)
+                    browser.close()
+                    self._send_screenshot(snap, "❌ Gemini Web: could not find prompt input")
+                    return None, snap
 
+                # ── Submit ─────────────────────────────────────────────────
+                time.sleep(0.5)
+                page.keyboard.press("Enter")
+                log.info("Prompt submitted — waiting for response...")
 
-    # ── Browser ────────────────────────────────────────────────────────────────
-    HEADLESS: bool = os.environ.get("PLAYWRIGHT_HEADLESS", "false").strip().lower() == "true"
-    VIEWPORT_W: int = int(os.environ.get("VIEWPORT_W", "430"))
-    VIEWPORT_H: int = int(os.environ.get("VIEWPORT_H", "932"))
+                # Wait for response to appear
+                response_selectors = [
+                    "model-response",
+                    ".model-response-text",
+                    "[data-testid='response']",
+                    ".response-container",
+                    "message-content",
+                ]
+                response_text = None
+                for _ in range(30):  # wait up to ~30s
+                    time.sleep(1)
+                    for sel in response_selectors:
+                        try:
+                            els = page.query_selector_all(sel)
+                            if els:
+                                last = els[-1]
+                                text = last.inner_text()
+                                if text and len(text.strip()) > 10:
+                                    response_text = text.strip()
+                                    break
+                        except Exception:
+                            continue
+                    if response_text:
+                        break
 
-    USER_AGENTS: List[str] = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    ]
+                if response_text:
+                    log.info(f"Gemini Web response: {response_text[:200]!r}...")
+                else:
+                    log.warning("Could not extract Gemini Web response text.")
 
-    # ── Target accounts whitelist (Faceless / Edit accounts) ──────────────────
-    # Add Instagram usernames you want the bot to scrape — one per line, no @.
-    # Set via the USERS_ATTACK env-var (newline- or comma-separated) or add
-    # them directly in the list below.  Leave empty to use the normal feed.
-    USERS_ATTACK: List[str] = [
-        u.strip().lstrip("@")
-        for u in os.environ.get(
-            "USERS_ATTACK",
-            # ── Default seed accounts ──────────────────────────────────────
-            # Add or remove usernames here:
-            "\n".join([
-                "thebl00dz",
-                # "username2",
-                # "username3",
-            ])
-        ).replace(",", "\n").splitlines()
-        if u.strip()
-    ]
+                # ── Screenshot ────────────────────────────────────────────
+                time.sleep(1)
+                snap = page.screenshot(type="jpeg", quality=85)
+                log.info(f"Gemini Web screenshot captured ({len(snap)//1024} KB)")
 
-    # ── Caption / hashtag content filter ──────────────────────────────────────
-    # Words found in captions or hashtags that immediately disqualify a reel.
-    CAPTION_BLACKLIST: List[str] = [
-        w.strip()
-        for w in os.environ.get(
-            "CAPTION_BLACKLIST",
-            "POV,Vlog,Day in my life,OOTD,Outfit of the day,GRWM,"
-            "Get ready with me,Selfie,My girlfriend,My boyfriend,Travel vlog,"
-            "storytime,come with me,day with me,morning routine,night routine",
-        ).split(",")
-        if w.strip()
-    ]
+                # Save to disk
+                try:
+                    ts = int(time.time())
+                    out_path = self._screenshot_dir / f"gemini_web_{ts}.jpg"
+                    out_path.write_bytes(snap)
+                    log.info(f"Screenshot saved: {out_path}")
+                except Exception as exc:
+                    log.warning(f"Could not save Gemini screenshot: {exc}")
 
-    # Words found in captions or hashtags that mark a reel as a desirable Edit.
-    CAPTION_WHITELIST: List[str] = [
-        w.strip()
-        for w in os.environ.get(
-            "CAPTION_WHITELIST",
-            "Movie edit,Scene pack,Anime edit,Car community,M5 f10,"
-            "Sigma edit,Quote of the day,Relatable quotes,edit,cinematic,"
-            "aesthetic,motivation,fyp edit,car edit",
-        ).split(",")
-        if w.strip()
-    ]
+                # ── Send screenshot to Telegram ───────────────────────────
+                caption = (
+                    f"🌐 <b>Gemini Web Response</b>\n"
+                    f"<code>{response_text[:300] if response_text else 'No text extracted'}</code>"
+                )
+                self._send_screenshot(snap, caption)
 
-    # ── Vision / black-bar detection ───────────────────────────────────────────
-    BLACK_THRESHOLD: int = int(os.environ.get("BLACK_THRESHOLD", "28"))
-    BLACK_BAR_RATIO: float = float(os.environ.get("BLACK_BAR_RATIO", "0.82"))
-    BORDER_SAMPLE_PCT: float = float(os.environ.get("BORDER_SAMPLE_PCT", "0.05"))
+                browser.close()
+                return response_text, snap
 
-    @classmethod
-    def summary(cls) -> str:
-        users_str = ", ".join(cls.USERS_ATTACK) if cls.USERS_ATTACK else "(feed mode)"
-        lines = [
-            "+- Config ---------------------------------------------------",
-            f"|  Max runtime        : {cls.MAX_RUNTIME_SECONDS}s (buffer {cls.SHUTDOWN_BUFFER_SECONDS}s)",
-            f"|  Min views          : {cls.MIN_VIEWS:,}",
-            f"|  Min likes          : {cls.MIN_LIKES:,}",
-            f"|  Target scan count  : {cls.TARGET_REELS_SCAN}",
-            f"|  Max send count     : {cls.MAX_QUALIFIED_SEND}",
-            f"|  Max upload retry   : {cls.MAX_UPLOAD_ATTEMPTS}",
-            f"|  Headless           : {cls.HEADLESS}",
-            f"|  DB path            : {cls.DB_PATH}",
-            f"|  Gemini model       : {cls.GEMINI_MODEL}",
-            f"|  Gemini enabled     : {bool(cls.GEMINI_API_KEY)}",
-            f"|  Gemini Web enabled : {cls.GEMINI_WEB_ENABLED and bool(cls.GEMINI_COOKIES)}",
-            f"|  Human approval     : {cls.HUMAN_APPROVAL_ENABLED}",
-            f"|  Groq model         : {cls.GROQ_MODEL}",
-            f"|  Groq enabled       : {bool(cls.GROQ_API_KEY)}",
-            f"|  OpenRouter model   : {cls.OPENROUTER_MODEL}",
-            f"|  OpenRouter enabled : {bool(cls.OPENROUTER_API_KEY)}",
-            f"|  Provider order     : {', '.join(cls.AI_PROVIDER_ORDER)}",
-            f"|  Gemini fallback    : {cls.ENABLE_GEMINI_FALLBACK}",
-            f"|  Fallback min views : {cls.FALLBACK_MIN_VIEWS:,}",
-            f"|  Fallback min likes : {cls.FALLBACK_MIN_LIKES:,}",
-            f"|  Telegram enabled   : {bool(cls.TELEGRAM_BOT_TOKEN and cls.TELEGRAM_CHAT_ID)}",
-            f"|  TikTok enabled     : {cls.TIKTOK_ENABLED}",
-            f"|  TikTok auth mode   : {cls.TIKTOK_AUTH_MODE if cls.TIKTOK_ENABLED else chr(110)+chr(47)+chr(97)}",
-            f"|  Cookies set        : {bool(cls.INSTAGRAM_SESSION_COOKIES)}",
-            f"|  Target accounts    : {users_str}",
-            f"|  Caption blacklist  : {len(cls.CAPTION_BLACKLIST)} words",
-            f"|  Caption whitelist  : {len(cls.CAPTION_WHITELIST)} words",
-            "+------------------------------------------------------------",
-        ]
-        return "\n".join(lines)
+        except Exception as exc:
+            log.error(f"GeminiWebBrowser.ask() failed: {type(exc).__name__}: {exc}")
+            return None, None
+
+    def _send_screenshot(self, screenshot_bytes: bytes, caption: str) -> None:
+        """Forward screenshot to Telegram if notifier is available."""
+        if self._notifier is None:
+            return
+        try:
+            self._notifier.send_photo(screenshot_bytes, caption=caption)
+            log.info("Gemini Web screenshot sent to Telegram.")
+        except Exception as exc:
+            log.warning(f"Could not send Gemini Web screenshot to Telegram: {exc}")
