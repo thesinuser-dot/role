@@ -48,10 +48,13 @@ class Config:
     # Auth mode: "cookies" (default) or "session"
     #   cookies  — point TIKTOK_COOKIES_FILE at a Netscape cookies.txt you
     #              exported from a logged-in browser session.
-    #   session  — paste the raw `sessionid` cookie value into TIKTOK_SESSION_ID.
+    #   session  — paste the raw `sessionid` cookie value (or full cookie
+    #              string) into TIKTOK_SESSION_COOKIES.
     TIKTOK_AUTH_MODE: str = os.environ.get("TIKTOK_AUTH_MODE", "cookies").strip().lower()
     TIKTOK_COOKIES_FILE: str = os.environ.get("TIKTOK_COOKIES_FILE", "/run/secrets/tiktok_cookies.txt")
-    TIKTOK_SESSION_ID: str = os.environ.get("TIKTOK_SESSION_ID", "")
+    # Accepts either a bare sessionid value ("abc123") or a full cookie string
+    # ("sessionid=abc123; tt_csrf_token=xyz; ...") — both are handled.
+    TIKTOK_SESSION_COOKIES: str = os.environ.get("TIKTOK_SESSION_COOKIES", "")
 
     # Run the upload browser headlessly (True) or visibly (False for debugging)
     TIKTOK_HEADLESS: bool = os.environ.get("TIKTOK_HEADLESS", "true").strip().lower() == "true"
