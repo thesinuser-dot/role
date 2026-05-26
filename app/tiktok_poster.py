@@ -252,7 +252,6 @@ class TikTokPoster:
         log.info("TikTok: attempting manual login via browser...")
         try:
             from playwright.sync_api import sync_playwright
-            import json as _json
 
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=False)
@@ -263,37 +262,34 @@ class TikTokPoster:
                           wait_until="domcontentloaded", timeout=30_000)
                 time.sleep(2)
 
-                # Fill email
                 page.fill("input[name='username'], input[type='text']", email)
                 time.sleep(0.5)
-                # Fill password
                 page.fill("input[type='password']", password)
                 time.sleep(0.5)
-                # Submit
                 page.keyboard.press("Enter")
-                time.sleep(6)  # wait for redirect + session cookie to be set
+                time.sleep(6)
 
-                # Check logged in
                 if "tiktok.com" in page.url and "login" not in page.url:
                     log.info("TikTok manual login succeeded ✅")
-                    # Export cookies in Netscape format
                     raw_cookies = ctx.cookies()
                     tmp = tempfile.NamedTemporaryFile(
                         suffix=".txt", prefix="tiktok_login_cookies_", delete=False
                     )
                     tmp.write(b"# Netscape HTTP Cookie File\n\n")
                     for c in raw_cookies:
+                        # Sanitize sameSite for Netscape format (TRUE/FALSE)
                         secure  = "TRUE" if c.get("secure") else "FALSE"
                         http    = "TRUE" if c.get("httpOnly") else "FALSE"
-                        expires = str(int(c.get("expires", 9999999999)))
+                        expires = str(int(c.get("expires") or 9999999999))
+                        domain  = c.get("domain", ".tiktok.com")
                         line = (
-                            f"{c['domain']}\t{http}\t{c['path']}\t"
+                            f"{domain}\t{http}\t{c['path']}\t"
                             f"{secure}\t{expires}\t{c['name']}\t{c['value']}\n"
                         )
                         tmp.write(line.encode())
                     tmp.close()
-                    self._temp_cookies    = Path(tmp.name)
-                    self._cookies_path    = Path(tmp.name)
+                    self._temp_cookies = Path(tmp.name)
+                    self._cookies_path = Path(tmp.name)
                     log.info(f"TikTok cookies saved to {tmp.name}")
                     browser.close()
                     return True
