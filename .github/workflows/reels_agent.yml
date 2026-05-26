@@ -334,10 +334,15 @@ jobs:
         env:
           INSTAGRAM_SESSION_COOKIES: ${{ secrets.INSTAGRAM_SESSION_COOKIES }}
           GEMINI_API_KEY:            ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_COOKIES:            ${{ secrets.GEMINI_COOKIES }}
+          GEMINI_EMAIL:              ${{ secrets.GEMINI_EMAIL }}
+          GEMINI_PASSWORD:           ${{ secrets.GEMINI_PASSWORD }}
           TELEGRAM_BOT_TOKEN:        ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:          ${{ secrets.TELEGRAM_CHAT_ID }}
           TIKTOK_SESSION_COOKIES:    ${{ secrets.TIKTOK_SESSION_COOKIES }}
           TIKTOK_COOKIES_FILE:       $HOME/.secrets/tiktok_cookies.txt
+          TIKTOK_EMAIL:              ${{ secrets.TIKTOK_EMAIL }}
+          TIKTOK_PASSWORD:           ${{ secrets.TIKTOK_PASSWORD }}
         run: |
           echo "DISPLAY=$DISPLAY"
           python3 app/agent.py 2>&1 | tee /var/log/reels-hunter/agent.log
