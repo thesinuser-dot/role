@@ -55,6 +55,26 @@ log = logging.getLogger("TikTokPoster")
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _extract_session_id(raw: str) -> Optional[str]:
+    """
+    Accept either:
+      - a bare session ID:          "abc123def456"
+      - a full cookie string:       "sessionid=abc123; tt_csrf_token=xyz; ..."
+    Returns the raw sessionid value, or None if it can't be found.
+    """
+    raw = raw.strip()
+    if not raw:
+        return None
+    # If it contains '=' it's a key=value cookie string — parse it
+    if "=" in raw:
+        for part in raw.replace(";", " ").split():
+            if part.startswith("sessionid="):
+                return part.split("=", 1)[1].strip()
+        return None  # sessionid not found in the string
+    # Otherwise treat the whole thing as the bare session ID
+    return raw
+
+
 def _write_session_cookies_file(session_id: str) -> Path:
     """
     Build a minimal Netscape-format cookies file from a raw sessionid value.
@@ -132,6 +152,19 @@ class TikTokPoster:
             self.enabled = False
             return
 
+        # Auto-switch to session mode if TIKTOK_SESSION_COOKIES is set
+        # and the user hasn't explicitly chosen a mode.
+        if (
+            Config.TIKTOK_SESSION_COOKIES.strip()
+            and Config.TIKTOK_AUTH_MODE == "cookies"
+            and not Path(Config.TIKTOK_COOKIES_FILE).exists()
+        ):
+            log.info(
+                "TIKTOK_SESSION_COOKIES is set and no cookies file found — "
+                "switching to session auth mode automatically."
+            )
+            Config.TIKTOK_AUTH_MODE = "session"
+
         self._cookies_path = self._resolve_cookies()
         if not self._cookies_path:
             log.error(
@@ -161,11 +194,19 @@ class TikTokPoster:
         mode = Config.TIKTOK_AUTH_MODE.lower()
 
         if mode == "session":
-            sid = Config.TIKTOK_SESSION_ID.strip()
-            if not sid:
-                log.error("TIKTOK_AUTH_MODE=session but TIKTOK_SESSION_ID is empty.")
+            raw = Config.TIKTOK_SESSION_COOKIES.strip()
+            if not raw:
+                log.error("TIKTOK_AUTH_MODE=session but TIKTOK_SESSION_COOKIES is empty.")
                 return None
-            path = _write_session_cookies_file(sid)
+            session_id = _extract_session_id(raw)
+            if not session_id:
+                log.error(
+                    "Could not extract sessionid from TIKTOK_SESSION_COOKIES. "
+                    "Set it to either the bare sessionid value or a full cookie string "
+                    "containing 'sessionid=<value>'."
+                )
+                return None
+            path = _write_session_cookies_file(session_id)
             self._temp_cookies = path
             log.info(f"Wrote session-based cookies to {path}")
             return path
