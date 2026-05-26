@@ -129,8 +129,9 @@ class Config:
     TIKTOK_EMAIL: str = os.environ.get("TIKTOK_EMAIL", "")
     TIKTOK_PASSWORD: str = os.environ.get("TIKTOK_PASSWORD", "")
 
-    # TikTok browser is ALWAYS visible (headless=False) so you can see the upload.
-    TIKTOK_HEADLESS: bool = False
+    # TikTok browser headless mode — defaults False (visible) for local use;
+    # set TIKTOK_HEADLESS=true in CI/GitHub Actions to avoid display errors.
+    TIKTOK_HEADLESS: bool = os.environ.get("TIKTOK_HEADLESS", "false").strip().lower() == "true"
 
     # Gemini Web browser is ALWAYS visible (headless=False) so you can see it.
     GEMINI_WEB_HEADLESS: bool = False
