@@ -168,6 +168,15 @@ class GeminiWebBrowser:
             return False
 
     def _manual_login(self) -> bool:
+        """
+        Log in to Gemini via Google account:
+          1. Open gemini.google.com/app
+          2. Click the "Sign in" button
+          3. Fill Google email -> Next
+          4. Fill Google password -> Next
+          5. Verify Gemini chat UI is accessible
+        Credentials come from GEMINI_EMAIL / GEMINI_PASSWORD secrets.
+        """
         try:
             from config import Config
             email    = Config.GEMINI_EMAIL.strip()
@@ -181,31 +190,60 @@ class GeminiWebBrowser:
 
         log.info("Attempting manual Google/Gemini login...")
         try:
+            from playwright.sync_api import TimeoutError as PWTimeout
             page = self._page
-            page.goto(GOOGLE_LOGIN_URL, wait_until="domcontentloaded", timeout=30_000)
+
+            # Step 1: go to Gemini and click "Sign in"
+            log.info("Gemini login step 1: opening gemini.google.com/app...")
+            page.goto(GEMINI_URL, wait_until="domcontentloaded", timeout=30_000)
+            time.sleep(3)
+
+            # Step 2: click "Sign in" button if present
+            log.info("Gemini login step 2: clicking Sign in...")
+            for sel in [
+                "a:has-text('Sign in')",
+                "button:has-text('Sign in')",
+                "[href*='accounts.google.com/signin']",
+            ]:
+                try:
+                    page.click(sel, timeout=6_000)
+                    break
+                except PWTimeout:
+                    continue
             time.sleep(2)
 
-            # Email step
-            page.wait_for_selector("input[type='email']", timeout=12_000)
+            # Step 3: Google email input
+            log.info("Gemini login step 3: filling Google email...")
+            page.wait_for_selector("input[type='email']", timeout=15_000)
             page.fill("input[type='email']", email)
             time.sleep(0.5)
             page.keyboard.press("Enter")
-            time.sleep(2)
+            time.sleep(3)
 
-            # Password step
-            page.wait_for_selector("input[type='password']", timeout=12_000)
+            # Step 4: Google password input
+            log.info("Gemini login step 4: filling Google password...")
+            page.wait_for_selector("input[type='password']", timeout=15_000)
             page.fill("input[type='password']", password)
             time.sleep(0.5)
             page.keyboard.press("Enter")
-            time.sleep(5)
+            time.sleep(6)
 
-            # Navigate to Gemini
-            page.goto(GEMINI_URL, wait_until="domcontentloaded", timeout=30_000)
-            time.sleep(4)
+            # Step 5: redirect back to Gemini if needed
+            if "gemini.google.com" not in page.url:
+                log.info("Gemini login step 5: navigating back to Gemini...")
+                page.goto(GEMINI_URL, wait_until="domcontentloaded", timeout=30_000)
+                time.sleep(4)
 
             if self._is_logged_in():
                 log.info("Manual Gemini login succeeded ✅")
+                # Save cookies back to context so they persist across queries
+                try:
+                    cookies = page.context.cookies()
+                    log.info(f"Gemini: captured {len(cookies)} cookies after login.")
+                except Exception:
+                    pass
                 return True
+
             log.error("Manual Gemini login failed — still not showing chat UI.")
             return False
         except Exception as exc:
@@ -316,19 +354,26 @@ class GeminiWebBrowser:
                 return None, None
 
         try:
-            # 1. Inject cookies + navigate
-            self._inject_cookies()
-            log.info("Navigating to Gemini (existing tab)...")
+            # 1. Inject cookies into context BEFORE navigating so Google
+            #    receives authenticated cookies on the very first request.
+            injected = self._inject_cookies()
+            log.info(f"Navigating to Gemini (existing tab, {injected} cookies pre-injected)...")
             page.goto(GEMINI_URL, wait_until="domcontentloaded", timeout=30_000)
             time.sleep(3)
 
-            # 2. Login check → manual login if needed
+            # 2. Login check — if not logged in, re-inject and reload once more
             if not self._is_logged_in():
-                log.warning("Gemini: not logged in — attempting manual login...")
-                if not self._manual_login():
-                    snap = page.screenshot(type="jpeg", quality=80)
-                    self._send_screenshot(snap, "❌ Gemini: login failed — set GEMINI_EMAIL + GEMINI_PASSWORD secrets")
-                    return None, snap
+                log.warning("Gemini: not logged in after cookie injection — retrying with fresh inject + reload...")
+                injected2 = self._inject_cookies()
+                if injected2 > 0:
+                    page.reload(wait_until="domcontentloaded", timeout=20_000)
+                    time.sleep(3)
+
+            if not self._is_logged_in():
+                log.error("Gemini: still not logged in — GEMINI_COOKIES secret is missing or expired.")
+                snap = page.screenshot(type="jpeg", quality=80)
+                self._send_screenshot(snap, "❌ Gemini: not logged in — update GEMINI_COOKIES secret with fresh exported cookies")
+                return None, snap
 
             # 3. Paste reel screenshot FIRST
             if image_bytes:
