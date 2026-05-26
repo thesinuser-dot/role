@@ -14,3 +14,6 @@ requests==2.32.3
 
 # Video download
 yt-dlp==2024.5.27
+
+# TikTok auto-upload (browser-based, no business account required)
+tiktok-uploader>=0.1.9
