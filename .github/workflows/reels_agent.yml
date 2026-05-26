@@ -316,18 +316,36 @@ jobs:
           sudo mkdir -p /var/log/reels-hunter
           sudo chmod 777 /var/log/reels-hunter
 
-      - name: Write TikTok cookies file
-        if: ${{ github.event.inputs.tiktok_enabled == 'true' || env.TIKTOK_ENABLED == 'true' }}
+      - name: Write cookies files
         env:
           TIKTOK_COOKIES: ${{ secrets.TIKTOK_COOKIES }}
+          GEMINI_COOKIES: ${{ secrets.GEMINI_COOKIES }}
         run: |
           mkdir -p "$HOME/.secrets"
+
+          # ── TikTok cookies ──────────────────────────────────────────────
           if [ -n "$TIKTOK_COOKIES" ]; then
-            echo "$TIKTOK_COOKIES" | base64 -d > "$HOME/.secrets/tiktok_cookies.txt"
+            # Support both raw JSON/Netscape and base64-encoded formats
+            if echo "$TIKTOK_COOKIES" | base64 -d 2>/dev/null | grep -q "tiktok"; then
+              echo "$TIKTOK_COOKIES" | base64 -d > "$HOME/.secrets/tiktok_cookies.txt"
+              echo "TikTok cookies written (base64 decoded)."
+            else
+              echo "$TIKTOK_COOKIES" > "$HOME/.secrets/tiktok_cookies.txt"
+              echo "TikTok cookies written (raw)."
+            fi
             chmod 600 "$HOME/.secrets/tiktok_cookies.txt"
-            echo "TikTok cookies written."
           else
-            echo "TIKTOK_COOKIES secret not set -- TikTok posting will be skipped."
+            echo "TIKTOK_COOKIES secret not set -- TikTok posting will use session auth or be skipped."
+          fi
+
+          # ── Gemini cookies ──────────────────────────────────────────────
+          # Write to file so the agent can re-read them if needed
+          if [ -n "$GEMINI_COOKIES" ]; then
+            echo "$GEMINI_COOKIES" > "$HOME/.secrets/gemini_cookies.json"
+            chmod 600 "$HOME/.secrets/gemini_cookies.json"
+            echo "Gemini cookies written to $HOME/.secrets/gemini_cookies.json"
+          else
+            echo "GEMINI_COOKIES secret not set -- Gemini Web will be disabled."
           fi
 
       - name: Run Reels AI Hunter agent
