@@ -358,7 +358,7 @@ jobs:
           TELEGRAM_BOT_TOKEN:        ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:          ${{ secrets.TELEGRAM_CHAT_ID }}
           TIKTOK_SESSION_COOKIES:    ${{ secrets.TIKTOK_SESSION_COOKIES }}
-          TIKTOK_COOKIES_FILE:       $HOME/.secrets/tiktok_cookies.txt
+          TIKTOK_COOKIES_FILE:       /home/runner/.secrets/tiktok_cookies.txt
           TIKTOK_EMAIL:              ${{ secrets.TIKTOK_EMAIL }}
           TIKTOK_PASSWORD:           ${{ secrets.TIKTOK_PASSWORD }}
           GH_PAT:                    ${{ secrets.GH_PAT }}
