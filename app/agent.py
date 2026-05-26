@@ -523,41 +523,51 @@ class InstagramAgent:
         except Exception as exc:
             self.log.warning(f"Startup tab TikTok failed (non-fatal): {exc}")
 
-        # Open Gemini in a new tab
+        # Open Gemini in a new tab — inject cookies BEFORE first navigation
+        # so Google never sees an unauthenticated browser request.
         try:
             self.log.info("Startup tab: opening Gemini...")
             gemini_page = ctx.new_page()
-            gemini_page.goto(
-                "https://gemini.google.com/app",
-                wait_until="domcontentloaded",
-                timeout=20_000,
-            )
-            # Inject Gemini cookies if set
+
+            # ── Inject Gemini/Google cookies before any navigation ────────
             if Config.GEMINI_COOKIES:
                 try:
                     import json as _json
+                    from gemini_web_browser import _sanitize_cookie as _gc_sanitize
                     raw = Config.GEMINI_COOKIES.strip()
                     cookies = []
                     try:
                         parsed = _json.loads(raw)
                         if isinstance(parsed, list):
-                            cookies = parsed
+                            for c in parsed:
+                                if c.get("name"):
+                                    cookies.append(_gc_sanitize(c, ".google.com"))
                     except Exception:
                         for part in raw.replace(";", "\n").splitlines():
                             part = part.strip()
                             if "=" in part:
-                                k, v = part.split("=", 1)
-                                cookies.append({
+                                k, _, v = part.partition("=")
+                                cookies.append(_gc_sanitize({
                                     "name": k.strip(), "value": v.strip(),
                                     "domain": ".google.com", "path": "/",
-                                    "httpOnly": False, "secure": True,
-                                })
+                                    "secure": True, "httpOnly": False,
+                                }, ".google.com"))
                     if cookies:
                         ctx.add_cookies(cookies)
-                        gemini_page.reload(wait_until="domcontentloaded", timeout=15_000)
-                        self.log.info(f"Gemini: injected {len(cookies)} cookies and reloaded.")
+                        self.log.info(f"Gemini: pre-injected {len(cookies)} cookies into context ✅")
+                    else:
+                        self.log.warning("Gemini: GEMINI_COOKIES set but no cookies parsed.")
                 except Exception as exc:
-                    self.log.warning(f"Gemini cookie injection failed (non-fatal): {exc}")
+                    self.log.warning(f"Gemini cookie pre-injection failed (non-fatal): {exc}")
+            else:
+                self.log.warning("Gemini: GEMINI_COOKIES not set — will attempt login fallback.")
+
+            # ── Now navigate (cookies already in context) ─────────────────
+            gemini_page.goto(
+                "https://gemini.google.com/app",
+                wait_until="domcontentloaded",
+                timeout=20_000,
+            )
 
             # Store gemini page so GeminiWebBrowser can reuse it
             self._gemini_page = gemini_page
