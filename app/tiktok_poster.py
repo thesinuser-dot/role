@@ -238,19 +238,28 @@ class TikTokPoster:
         )
 
     def _save_cookies(self, ctx) -> Path:
-        """Dump Playwright context cookies to a Netscape-format temp file."""
+        """Dump Playwright context cookies to a Netscape-format temp file.
+
+        Netscape column order:
+          domain  include_subdomains  path  secure  expires  name  value
+        The second column is TRUE when the domain starts with '.' (subdomain
+        wildcard match), not the httpOnly flag (which has no place in this format).
+        """
         raw_cookies = ctx.cookies()
         tmp = tempfile.NamedTemporaryFile(
             suffix=".txt", prefix="tiktok_login_cookies_", delete=False
         )
         tmp.write(b"# Netscape HTTP Cookie File\n\n")
         for c in raw_cookies:
-            secure  = "TRUE" if c.get("secure") else "FALSE"
-            http    = "TRUE" if c.get("httpOnly") else "FALSE"
-            expires = str(int(c.get("expires") or 9999999999))
-            domain  = c.get("domain", ".tiktok.com")
+            domain     = c.get("domain", ".tiktok.com")
+            # Ensure leading dot for subdomain matching (tiktok-uploader expects it)
+            if domain and not domain.startswith("."):
+                domain = "." + domain
+            include_sub = "TRUE" if domain.startswith(".") else "FALSE"
+            secure      = "TRUE" if c.get("secure") else "FALSE"
+            expires     = str(int(c.get("expires") or 9999999999))
             line = (
-                f"{domain}\t{http}\t{c['path']}\t"
+                f"{domain}\t{include_sub}\t{c['path']}\t"
                 f"{secure}\t{expires}\t{c['name']}\t{c['value']}\n"
             )
             tmp.write(line.encode())
@@ -259,6 +268,101 @@ class TikTokPoster:
         self._cookies_path = Path(tmp.name)
         log.info(f"TikTok cookies saved to {tmp.name}")
         return Path(tmp.name)
+
+    def _push_cookies_to_github_secret(self, cookie_path: Path) -> None:
+        """
+        Persist refreshed cookies back to the TIKTOK_COOKIES GitHub Actions secret
+        so future workflow runs start authenticated without re-logging in.
+
+        Requires:
+          GH_TOKEN           — a PAT or the workflow's GITHUB_TOKEN with
+                               secrets:write + repo scope.
+          GITHUB_REPOSITORY  — set automatically by Actions (e.g. "owner/repo").
+
+        Fails silently outside GitHub Actions or when credentials are absent —
+        the upload already succeeded and this must never raise.
+        """
+        import base64
+        import json
+        import urllib.request
+        import urllib.error
+
+        gh_token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN", "")
+        repo     = os.environ.get("GITHUB_REPOSITORY", "")
+
+        if not gh_token or not repo:
+            log.warning(
+                "[TikTok] _push_cookies_to_github_secret: "
+                "GH_TOKEN or GITHUB_REPOSITORY not set — skipping secret update."
+            )
+            return
+
+        try:
+            cookie_b64 = base64.b64encode(cookie_path.read_bytes()).decode()
+        except OSError as exc:
+            log.warning(f"[TikTok] Could not read cookie file for secret push: {exc}")
+            return
+
+        try:
+            # ── 1. Fetch repo public key for secret encryption ────────────
+            pk_url = f"https://api.github.com/repos/{repo}/actions/secrets/public-key"
+            req = urllib.request.Request(
+                pk_url,
+                headers={
+                    "Authorization": f"Bearer {gh_token}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                pk_data = json.loads(resp.read())
+            key_id    = pk_data["key_id"]
+            pub_key_b = base64.b64decode(pk_data["key"])
+
+            # ── 2. Encrypt with libsodium (PyNaCl) ────────────────────────
+            try:
+                from nacl.public import PublicKey, SealedBox  # type: ignore
+            except ImportError:
+                log.warning(
+                    "[TikTok] PyNaCl not installed — cannot encrypt secret. "
+                    "Run: pip install PyNaCl"
+                )
+                return
+
+            encrypted = base64.b64encode(
+                SealedBox(PublicKey(pub_key_b)).encrypt(cookie_b64.encode())
+            ).decode()
+
+            # ── 3. PUT the updated secret ─────────────────────────────────
+            secret_url = (
+                f"https://api.github.com/repos/{repo}/actions/secrets/TIKTOK_COOKIES"
+            )
+            payload = json.dumps(
+                {"encrypted_value": encrypted, "key_id": key_id}
+            ).encode()
+            put_req = urllib.request.Request(
+                secret_url,
+                data=payload,
+                method="PUT",
+                headers={
+                    "Authorization": f"Bearer {gh_token}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                    "Content-Type": "application/json",
+                },
+            )
+            with urllib.request.urlopen(put_req, timeout=15) as resp:
+                status = resp.status
+
+            if status in (201, 204):
+                log.info("[TikTok] ✅ TIKTOK_COOKIES secret updated in GitHub.")
+            else:
+                log.warning(f"[TikTok] Secret update returned unexpected status {status}.")
+
+        except urllib.error.HTTPError as exc:
+            log.warning(f"[TikTok] GitHub API error updating secret: {exc.code} {exc.reason}")
+        except Exception as exc:
+            log.warning(f"[TikTok] Failed to push cookies to GitHub secret: {exc}")
 
     def _manual_login_and_save_cookies(self) -> bool:
         """
