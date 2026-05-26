@@ -343,12 +343,24 @@ jobs:
           TIKTOK_COOKIES_FILE:       $HOME/.secrets/tiktok_cookies.txt
           TIKTOK_EMAIL:              ${{ secrets.TIKTOK_EMAIL }}
           TIKTOK_PASSWORD:           ${{ secrets.TIKTOK_PASSWORD }}
+          B2_APPLICATION_KEY_ID:     ${{ secrets.B2_APPLICATION_KEY_ID }}
+          B2_APPLICATION_KEY:        ${{ secrets.B2_APPLICATION_KEY }}
+          B2_BUCKET_NAME:            ${{ secrets.B2_BUCKET_NAME }}
         run: |
           echo "DISPLAY=$DISPLAY"
           python3 app/agent.py 2>&1 | tee /var/log/reels-hunter/agent.log
 
-      - name: Upload screenshots and logs on failure
-        if: failure()
+      - name: Upload downloaded reels
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reels-downloads-${{ github.run_id }}
+          path: /tmp/reels_downloads/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Upload screenshots and logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: reels-debug-${{ github.run_id }}
