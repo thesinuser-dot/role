@@ -361,6 +361,7 @@ jobs:
           TIKTOK_COOKIES_FILE:       $HOME/.secrets/tiktok_cookies.txt
           TIKTOK_EMAIL:              ${{ secrets.TIKTOK_EMAIL }}
           TIKTOK_PASSWORD:           ${{ secrets.TIKTOK_PASSWORD }}
+          GH_PAT:                    ${{ secrets.GH_PAT }}
           B2_APPLICATION_KEY_ID:     ${{ secrets.B2_APPLICATION_KEY_ID }}
           B2_APPLICATION_KEY:        ${{ secrets.B2_APPLICATION_KEY }}
           B2_BUCKET_NAME:            ${{ secrets.B2_BUCKET_NAME }}
