@@ -51,7 +51,7 @@ class Config:
     #   session  — paste the raw `sessionid` cookie value (or full cookie
     #              string) into TIKTOK_SESSION_COOKIES.
     TIKTOK_AUTH_MODE: str = os.environ.get("TIKTOK_AUTH_MODE", "cookies").strip().lower()
-    TIKTOK_COOKIES_FILE: str = os.environ.get("TIKTOK_COOKIES_FILE", "/run/secrets/tiktok_cookies.txt")
+    TIKTOK_COOKIES_FILE: str = os.environ.get("TIKTOK_COOKIES_FILE", os.path.expanduser("~/.secrets/tiktok_cookies.txt"))
     # Accepts either a bare sessionid value ("abc123") or a full cookie string
     # ("sessionid=abc123; tt_csrf_token=xyz; ...") — both are handled.
     TIKTOK_SESSION_COOKIES: str = os.environ.get("TIKTOK_SESSION_COOKIES", "")
@@ -96,12 +96,6 @@ class Config:
     SCREENSHOT_DIR: Path = Path(os.environ.get("SCREENSHOT_DIR", "/tmp/reels_screenshots"))
     COOKIES_FILE: Path = Path("/tmp/ig_cookies.txt")
 
-    # ── Proxy pool (Webshare.io) ───────────────────────────────────────────────
-    WEBSHARE_API_KEY: str = os.environ.get("WEBSHARE_API_KEY", "sbbfvqw45jm6f4d3pdbgirq4ids75i9ss137246x")
-    # "direct" = datacenter rotating proxies; "backbone" for residential
-    WEBSHARE_PROXY_MODE: str = os.environ.get("WEBSHARE_PROXY_MODE", "direct")
-    # Set to "false" to disable proxies entirely (useful for local testing)
-    USE_PROXY: bool = os.environ.get("USE_PROXY", "true").strip().lower() == "true"
 
     # ── Browser ────────────────────────────────────────────────────────────────
     HEADLESS: bool = os.environ.get("PLAYWRIGHT_HEADLESS", "false").strip().lower() == "true"
@@ -188,9 +182,6 @@ class Config:
             f"|  TikTok enabled     : {cls.TIKTOK_ENABLED}",
             f"|  TikTok auth mode   : {cls.TIKTOK_AUTH_MODE if cls.TIKTOK_ENABLED else chr(110)+chr(47)+chr(97)}",
             f"|  Cookies set        : {bool(cls.INSTAGRAM_SESSION_COOKIES)}",
-            f"|  Proxy enabled      : {cls.USE_PROXY}",
-            f"|  Proxy mode         : {cls.WEBSHARE_PROXY_MODE}",
-            f"|  Webshare key set   : {bool(cls.WEBSHARE_API_KEY)}",
             f"|  Target accounts    : {users_str}",
             f"|  Caption blacklist  : {len(cls.CAPTION_BLACKLIST)} words",
             f"|  Caption whitelist  : {len(cls.CAPTION_WHITELIST)} words",
