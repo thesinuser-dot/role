@@ -248,12 +248,15 @@ class ReelCollector:
                     label="views",
                 )
 
-            likes = self._extract_count(
-                SelectorRegistry.LIKE_COUNT,
-                keywords=["like"],
-                exclude="unlike",
-                label="likes",
-            )
+            likes = self._extract_likes_js()
+            if likes == 0:
+                self.log.debug("JS like extraction got 0 — trying CSS fallback")
+                likes = self._extract_count(
+                    SelectorRegistry.LIKE_COUNT,
+                    keywords=["like"],
+                    exclude="unlike",
+                    label="likes",
+                )
 
             if views > 0 or likes > 0:
                 break
@@ -382,6 +385,150 @@ class ReelCollector:
                 return val
         except Exception as exc:
             self.log.debug(f"JS view extraction error: {exc}")
+        return 0
+
+    def _extract_likes_js(self) -> int:
+        """
+        Multi-strategy JS extraction for like count.
+
+        Instagram renders the like count as a bare number span next to the
+        like button — that span contains no "like" text, so the keyword-based
+        _extract_count() always misses it.
+
+        Strategies (most-reliable first):
+          1. window.__additionalData / window._sharedData — like_count field
+          2. Inline <script> JSON blobs — like_count / edge_liked_by
+          3. aria-label "X likes" on the like button or any element
+          4. Like button → parent → sibling span with a number
+          5. Text-node walk: number immediately before/after "likes" word
+          6. window.__bbox JSON scan
+        """
+        try:
+            raw = self._page.evaluate("""
+                () => {
+                    // ── Strategy 1: in-page data objects ─────────────────────────────
+                    try {
+                        if (window.__additionalData) {
+                            const vals = Object.values(window.__additionalData);
+                            for (const v of vals) {
+                                const media = v?.data?.xdt_api__v1__media__shortcode__web_info?.data?.items?.[0]
+                                    || v?.data?.shortcode_media;
+                                if (media) {
+                                    const lc = media.like_count
+                                        ?? media.edge_media_preview_like?.count
+                                        ?? media.edge_liked_by?.count
+                                        ?? null;
+                                    if (lc != null && lc >= 0) return String(lc);
+                                }
+                            }
+                        }
+                    } catch(e) {}
+
+                    try {
+                        if (window._sharedData) {
+                            const media = window._sharedData?.entry_data?.PostPage?.[0]
+                                ?.graphql?.shortcode_media;
+                            if (media) {
+                                const lc = media.edge_media_preview_like?.count
+                                    ?? media.edge_liked_by?.count;
+                                if (lc != null) return String(lc);
+                            }
+                        }
+                    } catch(e) {}
+
+                    // ── Strategy 2: inline <script> JSON blobs ────────────────────────
+                    try {
+                        const scripts = document.querySelectorAll(
+                            'script[type="application/json"], script:not([src])'
+                        );
+                        for (const s of scripts) {
+                            const txt = s.textContent || '';
+                            // like_count or edge_liked_by / edge_media_preview_like count
+                            const m = /\"(?:like_count|edge_liked_by|edge_media_preview_like)\"[^}]*?\"count\"\s*:\s*(\d+)/.exec(txt)
+                                   || /\"like_count\"\s*:\s*(\d+)/.exec(txt);
+                            if (m && parseInt(m[1]) >= 0) return m[1];
+                        }
+                    } catch(e) {}
+
+                    // ── Strategy 3: aria-label "X likes" ─────────────────────────────
+                    try {
+                        for (const el of document.querySelectorAll('[aria-label]')) {
+                            const label = el.getAttribute('aria-label') || '';
+                            const m = /([\d,]+\.?\d*\s*[KMBkmb]?)\s+likes?/i.exec(label);
+                            if (m) return m[1];
+                        }
+                    } catch(e) {}
+
+                    // ── Strategy 4: like button → parent container → sibling number span
+                    try {
+                        // Find the like button (not unlike)
+                        const likeBtn = Array.from(
+                            document.querySelectorAll('button[aria-label]')
+                        ).find(b => {
+                            const lbl = (b.getAttribute('aria-label') || '').toLowerCase();
+                            return lbl.includes('like') && !lbl.includes('unlike');
+                        });
+                        if (likeBtn) {
+                            // Walk up to find a container that also holds the count span
+                            let container = likeBtn.parentElement;
+                            for (let depth = 0; depth < 5 && container; depth++) {
+                                // Look for a sibling or child span/div with a bare number
+                                const candidates = container.querySelectorAll('span, div');
+                                for (const c of candidates) {
+                                    if (c === likeBtn || c.contains(likeBtn)) continue;
+                                    const t = (c.textContent || '').trim();
+                                    const m = /^([\d,]+\.?\d*\s*[KMBkmb]?)$/.exec(t);
+                                    if (m) return m[1];
+                                }
+                                container = container.parentElement;
+                            }
+                        }
+                    } catch(e) {}
+
+                    // ── Strategy 5: text-node walk for number near "likes" ────────────
+                    try {
+                        const walker = document.createTreeWalker(
+                            document.body, NodeFilter.SHOW_TEXT, null, false
+                        );
+                        const texts = [];
+                        let node;
+                        while ((node = walker.nextNode())) {
+                            const t = node.textContent.trim();
+                            if (t) texts.push(t);
+                        }
+                        // "112 likes" in a single text node
+                        for (const t of texts) {
+                            const m = /^([\d,]+\.?\d*\s*[KMBkmb]?)\s+likes?$/i.exec(t);
+                            if (m) return m[1];
+                        }
+                        // number node then "likes" within 3 positions
+                        for (let i = 0; i < texts.length - 1; i++) {
+                            const nearby = [texts[i+1], texts[i+2], texts[i+3]].filter(Boolean);
+                            if (nearby.some(t => /^likes?$/i.test(t))) {
+                                const m = /^([\d,]+\.?\d*\s*[KMBkmb]?)$/.exec(texts[i]);
+                                if (m) return m[1];
+                            }
+                        }
+                    } catch(e) {}
+
+                    // ── Strategy 6: window.__bbox ─────────────────────────────────────
+                    try {
+                        if (window.__bbox && window.__bbox.define) {
+                            const str = JSON.stringify(window.__bbox);
+                            const m = /\"like_count\":(\d+)/.exec(str);
+                            if (m) return m[1];
+                        }
+                    } catch(e) {}
+
+                    return null;
+                }
+            """)
+            if raw is not None:
+                val = self._parse_count(str(raw))
+                self.log.debug(f"JS like extraction found: {raw!r} → {val:,}")
+                return val
+        except Exception as exc:
+            self.log.debug(f"JS like extraction error: {exc}")
         return 0
 
     def _extract_count(
@@ -519,7 +666,7 @@ class ReelCollector:
 
     # ── Reel URL collection ───────────────────────────────────────────────────
 
-    def collect_reel_urls(self, notifier=None, stop_fn=None) -> List[str]:
+    def collect_reel_urls(self, notifier=None, stop_fn=None, drain_fn=None) -> List[str]:
         """
         Collect reel URLs via ArrowDown keyboard navigation.
         """
@@ -624,6 +771,12 @@ class ReelCollector:
         for step in range(max_steps):
             if len(collected) >= Config.TARGET_REELS_SCAN:
                 break
+            if drain_fn is not None:
+                try:
+                    drain_fn()
+                except Exception:
+                    pass
+
             if stop_fn is not None and stop_fn():
                 self.log.info(
                     f"/skip received — stopping collection early "
