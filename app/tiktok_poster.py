@@ -25,6 +25,8 @@
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import os
 import signal
@@ -260,6 +262,91 @@ class TikTokPoster:
         log.info(f"TikTok cookies saved to {tmp.name}")
         return Path(tmp.name)
 
+    def _push_cookies_to_github_secret(self, cookies_path: Path) -> bool:
+        """
+        After a successful manual login, automatically update the TIKTOK_COOKIES
+        GitHub Actions secret so the next run starts authenticated — no manual
+        copy-paste needed.
+
+        Requires two env vars (set them as GitHub secrets and pass through the
+        workflow):
+          GH_PAT            — Personal Access Token with repo secrets:write scope
+          GITHUB_REPOSITORY — automatically set by GitHub Actions (owner/repo)
+
+        The cookies file is base64-encoded before storage so Netscape characters
+        survive the secret round-trip.  The existing workflow "Write cookies
+        files" step already handles the base64-decode automatically.
+
+        Returns True on success, False if skipped or failed.
+        """
+        pat = os.environ.get("GH_PAT", "").strip()
+        repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
+        if not pat or not repo:
+            log.debug(
+                "GH_PAT or GITHUB_REPOSITORY not set — "
+                "skipping automatic TIKTOK_COOKIES secret update."
+            )
+            return False
+
+        import urllib.request
+        import urllib.error
+
+        try:
+            from nacl import encoding, public  # type: ignore
+        except ImportError:
+            log.warning(
+                "PyNaCl not installed — cannot auto-update GitHub secret. "
+                "Add 'PyNaCl' to requirements.txt to enable this feature."
+            )
+            return False
+
+        try:
+            raw = cookies_path.read_bytes()
+            encoded_cookies = base64.b64encode(raw).decode()
+
+            api = "https://api.github.com"
+            headers = {
+                "Authorization": f"Bearer {pat}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "Content-Type": "application/json",
+            }
+
+            def _gh(method: str, url: str, body: bytes | None = None) -> dict:
+                req = urllib.request.Request(
+                    url, data=body, headers=headers, method=method
+                )
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    return json.loads(r.read())
+
+            # 1. Fetch the repo public key (needed to encrypt the secret)
+            pk = _gh("GET", f"{api}/repos/{repo}/actions/secrets/public-key")
+            pub_key_bytes = base64.b64decode(pk["key"])
+            key_id = pk["key_id"]
+
+            # 2. Encrypt with libsodium sealed box
+            box = public.SealedBox(public.PublicKey(pub_key_bytes))
+            encrypted = base64.b64encode(
+                box.encrypt(encoded_cookies.encode())
+            ).decode()
+
+            # 3. Upsert the secret
+            _gh(
+                "PUT",
+                f"{api}/repos/{repo}/actions/secrets/TIKTOK_COOKIES",
+                json.dumps({"encrypted_value": encrypted, "key_id": key_id}).encode(),
+            )
+
+            log.info(
+                "✅ TIKTOK_COOKIES GitHub secret updated automatically — "
+                "next run will use fresh cookies without any manual steps."
+            )
+            return True
+
+        except Exception as exc:
+            log.warning(f"Could not auto-update TIKTOK_COOKIES secret: {exc}")
+            return False
+
     def _manual_login_and_save_cookies(self) -> bool:
         """
         Open a visible TikTok browser and log in with email+password following
@@ -359,8 +446,9 @@ class TikTokPoster:
 
                 if "tiktok.com" in page.url and "login" not in page.url:
                     log.info("TikTok manual login succeeded ✅")
-                    self._save_cookies(ctx)
+                    cookie_path = self._save_cookies(ctx)
                     browser.close()
+                    self._push_cookies_to_github_secret(cookie_path)
                     return True
 
                 # Captcha / 2FA may need extra time
@@ -368,8 +456,9 @@ class TikTokPoster:
                 time.sleep(10)
                 if "tiktok.com" in page.url and "login" not in page.url:
                     log.info("TikTok manual login succeeded after extra wait ✅")
-                    self._save_cookies(ctx)
+                    cookie_path = self._save_cookies(ctx)
                     browser.close()
+                    self._push_cookies_to_github_secret(cookie_path)
                     return True
 
                 log.error(f"TikTok manual login failed — still on: {page.url}")
