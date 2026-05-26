@@ -152,6 +152,12 @@ class Config:
         if h.strip()
     ]
 
+    # ── Backblaze B2 storage ───────────────────────────────────────────────────
+    # Set these to persist downloaded reels beyond the GitHub Actions run.
+    B2_APPLICATION_KEY_ID: str = os.environ.get("B2_APPLICATION_KEY_ID", "")
+    B2_APPLICATION_KEY:    str = os.environ.get("B2_APPLICATION_KEY", "")
+    B2_BUCKET_NAME:        str = os.environ.get("B2_BUCKET_NAME", "reels-hunter")
+
     # ── Database ───────────────────────────────────────────────────────────────
     DB_PATH: str = os.environ.get("DB_PATH", "history.db")
 
