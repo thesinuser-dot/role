@@ -245,7 +245,14 @@ class TikTokPoster:
         The second column is TRUE when the domain starts with '.' (subdomain
         wildcard match), not the httpOnly flag (which has no place in this format).
         """
-        raw_cookies = ctx.cookies()
+        # Pass explicit URLs so Playwright returns all matching cookies rather
+        # than potentially an empty list (the no-arg form is unreliable across
+        # Playwright versions when cookies are domain-scoped).
+        raw_cookies = ctx.cookies([
+            "https://www.tiktok.com",
+            "https://m.tiktok.com",
+            "https://tiktok.com",
+        ])
         tmp = tempfile.NamedTemporaryFile(
             suffix=".txt", prefix="tiktok_login_cookies_", delete=False
         )
@@ -257,7 +264,11 @@ class TikTokPoster:
                 domain = "." + domain
             include_sub = "TRUE" if domain.startswith(".") else "FALSE"
             secure      = "TRUE" if c.get("secure") else "FALSE"
-            expires     = str(int(c.get("expires") or 9999999999))
+            # Playwright uses -1 for session cookies (no explicit expiry).
+            # -1 is truthy in Python, so `c.get("expires") or fallback` would
+            # keep -1 and write an invalid/expired timestamp.  Check explicitly.
+            _exp        = c.get("expires", -1)
+            expires     = str(int(_exp) if isinstance(_exp, (int, float)) and _exp > 0 else 9999999999)
             line = (
                 f"{domain}\t{include_sub}\t{c['path']}\t"
                 f"{secure}\t{expires}\t{c['name']}\t{c['value']}\n"
