@@ -98,23 +98,24 @@ jobs:
       - name: Start virtual desktop (Xpra HTML5)
         run: |
           # Install Xpra from official repo (replaces Xvfb + x11vnc + websockify + noVNC)
-          # Probe which distro codename Xpra has actually published.
-          # xpra.org does not always publish a new directory the moment Ubuntu
-          # cuts a new release, so we walk a fallback list.
-          # NOTE: use curl for BOTH the probe and the download.  wget --spider
-          # (HEAD) can return 200 while wget -qO (GET) returns exit 8 on xpra.org
-          # due to CDN inconsistency; curl -fsSL handles redirects and is consistent.
+          # Walk a fallback list of codenames and do a real GET download as the
+          # probe — no HEAD request at all.  xpra.org's CDN returns 200 for HEAD
+          # but 404 for GET on the same URL, so HEAD-based probes give false
+          # positives.  Attempting the actual download is the only reliable test.
           XPRA_CODENAME=$(lsb_release -cs)
           XPRA_REPO=""
           for _cn in "${XPRA_CODENAME}" noble jammy focal; do
-            if curl -fsSL --head "https://xpra.org/repos/${_cn}/xpra.gpg" -o /dev/null 2>/dev/null; then
+            if curl -fsSL "https://xpra.org/repos/${_cn}/xpra.gpg" -o /tmp/xpra.gpg 2>/dev/null; then
               XPRA_REPO="${_cn}"
               break
             fi
           done
-          : "${XPRA_REPO:=jammy}"   # absolute last resort
+          if [ -z "${XPRA_REPO}" ]; then
+            echo "ERROR: could not download xpra.gpg for any known codename" >&2
+            exit 1
+          fi
           echo "Xpra repo codename: ${XPRA_REPO} (runner is ${XPRA_CODENAME})"
-          curl -fsSL "https://xpra.org/repos/${XPRA_REPO}/xpra.gpg" -o /tmp/xpra.gpg
+          # /tmp/xpra.gpg already written by the successful loop iteration above
           sudo install -o root -g root -m 644 /tmp/xpra.gpg /usr/share/keyrings/xpra.gpg
           echo "deb [signed-by=/usr/share/keyrings/xpra.gpg] https://xpra.org/repos/${XPRA_REPO} ${XPRA_REPO} main" \
             | sudo tee /etc/apt/sources.list.d/xpra.list
