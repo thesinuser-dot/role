@@ -12,7 +12,7 @@ on:
       min_views:
         description: "Minimum view count"
         required: false
-        default: "50000"
+        default: "0"
       max_reels:
         description: "Max reels to send"
         required: false
@@ -20,7 +20,7 @@ on:
       tiktok_enabled:
         description: "Auto-post to TikTok (true/false)"
         required: false
-        default: "false"
+        default: "true"
 
 env:
   MIN_VIEWS:               ${{ github.event.inputs.min_views  || '50000' }}
@@ -125,7 +125,7 @@ jobs:
           echo "Xpra repo codename: ${XPRA_REPO} (runner is ${XPRA_CODENAME})"
           sudo cp /tmp/xpra.sources /etc/apt/sources.list.d/xpra.sources
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends xpra xpra-html5
+          sudo apt-get install -y --no-install-recommends xpra xpra-html5 xpra-x11
 
           sudo mkdir -p /run/xpra
           sudo chmod 1777 /run/xpra
