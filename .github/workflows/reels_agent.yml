@@ -97,28 +97,33 @@ jobs:
 
       - name: Start virtual desktop (Xpra HTML5)
         run: |
-          # Install Xpra from official repo (replaces Xvfb + x11vnc + websockify + noVNC)
-          # Walk a fallback list of codenames and do a real GET download as the
-          # probe — no HEAD request at all.  xpra.org's CDN returns 200 for HEAD
-          # but 404 for GET on the same URL, so HEAD-based probes give false
-          # positives.  Attempting the actual download is the only reliable test.
+          # Install Xpra from official repo
+          # The old per-codename GPG path (xpra.org/repos/$cn/xpra.gpg) no
+          # longer exists.  Current method (as of 2025):
+          #   - Single global key:  https://xpra.org/xpra.asc
+          #   - Per-codename repo:  GitHub packaging/repos/$cn/xpra.sources
           XPRA_CODENAME=$(lsb_release -cs)
+
+          # 1. Fetch the global signing key (one URL, not per-distro)
+          curl -fsSL "https://xpra.org/xpra.asc" \
+            | sudo tee /usr/share/keyrings/xpra.asc > /dev/null
+
+          # 2. Fetch the .sources file for the best available codename
           XPRA_REPO=""
           for _cn in "${XPRA_CODENAME}" noble jammy focal; do
-            if curl -fsSL "https://xpra.org/repos/${_cn}/xpra.gpg" -o /tmp/xpra.gpg 2>/dev/null; then
+            if curl -fsSL \
+                 "https://raw.githubusercontent.com/Xpra-org/xpra/master/packaging/repos/${_cn}/xpra.sources" \
+                 -o /tmp/xpra.sources 2>/dev/null; then
               XPRA_REPO="${_cn}"
               break
             fi
           done
           if [ -z "${XPRA_REPO}" ]; then
-            echo "ERROR: could not download xpra.gpg for any known codename" >&2
+            echo "ERROR: could not find xpra.sources for any known codename" >&2
             exit 1
           fi
           echo "Xpra repo codename: ${XPRA_REPO} (runner is ${XPRA_CODENAME})"
-          # /tmp/xpra.gpg already written by the successful loop iteration above
-          sudo install -o root -g root -m 644 /tmp/xpra.gpg /usr/share/keyrings/xpra.gpg
-          echo "deb [signed-by=/usr/share/keyrings/xpra.gpg] https://xpra.org/repos/${XPRA_REPO} ${XPRA_REPO} main" \
-            | sudo tee /etc/apt/sources.list.d/xpra.list
+          sudo cp /tmp/xpra.sources /etc/apt/sources.list.d/xpra.sources
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends xpra xpra-html5
 
