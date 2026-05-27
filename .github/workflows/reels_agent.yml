@@ -150,15 +150,28 @@ jobs:
             --file-transfer=no \
             --printing=no \
             > /tmp/xpra.log 2>&1 &
+          XPRA_PID=$!
 
-          # Wait for Xpra to be ready (up to 30s)
-          for i in $(seq 1 30); do
+          # Wait for Xpra to be ready (up to 60s); fail loudly with log if it never starts
+          XPRA_READY=0
+          for i in $(seq 1 60); do
             if xpra info "$DISPLAY" >/dev/null 2>&1; then
               echo "Xpra ready after ${i}s"
+              XPRA_READY=1
+              break
+            fi
+            if ! kill -0 "$XPRA_PID" 2>/dev/null; then
+              echo "Xpra process exited prematurely" >&2
               break
             fi
             sleep 1
           done
+
+          if [ "$XPRA_READY" -ne 1 ]; then
+            echo "=== Xpra failed to start. Full log: ===" >&2
+            cat /tmp/xpra.log >&2
+            exit 1
+          fi
 
           echo "Desktop ready -- http://localhost:${WEB_PORT}/"
 
