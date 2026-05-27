@@ -12,7 +12,7 @@ on:
       min_views:
         description: "Minimum view count"
         required: false
-        default: "0"
+        default: "50000"
       max_reels:
         description: "Max reels to send"
         required: false
@@ -20,7 +20,7 @@ on:
       tiktok_enabled:
         description: "Auto-post to TikTok (true/false)"
         required: false
-        default: "true"
+        default: "false"
 
 env:
   MIN_VIEWS:               ${{ github.event.inputs.min_views  || '50000' }}
@@ -172,6 +172,11 @@ jobs:
             cat /tmp/xpra.log >&2
             exit 1
           fi
+
+          # Open local X access so processes launched by subsequent steps
+          # (Playwright/Chromium) can connect without an xauth cookie.
+          # Safe in CI — there is no network-accessible X display here.
+          xhost +local: || true
 
           echo "Desktop ready -- http://localhost:${WEB_PORT}/"
 
