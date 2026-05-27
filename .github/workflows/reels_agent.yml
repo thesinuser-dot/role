@@ -98,9 +98,10 @@ jobs:
       - name: Start virtual desktop (Xpra HTML5)
         run: |
           # Install Xpra from official repo (replaces Xvfb + x11vnc + websockify + noVNC)
-          wget -qO /tmp/xpra.gpg https://xpra.org/repos/jammy/xpra.gpg
+          XPRA_CODENAME=$(lsb_release -cs)
+          wget -qO /tmp/xpra.gpg "https://xpra.org/repos/${XPRA_CODENAME}/xpra.gpg"
           sudo install -o root -g root -m 644 /tmp/xpra.gpg /usr/share/keyrings/xpra.gpg
-          echo "deb [signed-by=/usr/share/keyrings/xpra.gpg] https://xpra.org/repos/jammy jammy main" \
+          echo "deb [signed-by=/usr/share/keyrings/xpra.gpg] https://xpra.org/repos/${XPRA_CODENAME} ${XPRA_CODENAME} main" \
             | sudo tee /etc/apt/sources.list.d/xpra.list
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends xpra xpra-html5
@@ -117,11 +118,11 @@ jobs:
             --dpi=96 \
             --desktop-scaling=off \
             --opengl=no \
-            --no-mdns \
-            --no-notifications \
-            --no-bell \
-            --no-pulseaudio \
-            --speaker=off \
+            --mdns=no \
+            --notifications=no \
+            --bell=no \
+            --pulseaudio=no \
+            --speaker=no \
             --microphone=off \
             --webcam=no \
             --clipboard=no \
