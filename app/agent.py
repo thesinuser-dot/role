@@ -518,7 +518,6 @@ class InstagramAgent:
             _tt_cookies_injected = 0
             _tt_cookies_file = Config.TIKTOK_COOKIES_FILE
             try:
-                import json as _json
                 from pathlib import Path as _Path
 
                 _tt_path = _Path(_tt_cookies_file)
@@ -535,11 +534,9 @@ class InstagramAgent:
                             try:
                                 _exp = int(float(_expires))
                                 if _exp <= 0:
-                                    _exp = 2147483647
+                                    _exp = 9999999999
                             except Exception:
-                                _exp = 2147483647
-                            if not _domain.startswith("."):
-                                _domain = "." + _domain
+                                _exp = 9999999999
                             _tt_pw_cookies.append({
                                 "name":     _name,
                                 "value":    _value,
@@ -547,7 +544,7 @@ class InstagramAgent:
                                 "path":     _path or "/",
                                 "secure":   _secure.upper() == "TRUE",
                                 "httpOnly": False,
-                                "sameSite": "None",
+                                "sameSite": "None" if _domain.startswith(".") else "Lax",
                                 "expires":  _exp,
                             })
                     if _tt_pw_cookies:
