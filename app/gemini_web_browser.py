@@ -81,6 +81,16 @@ _SAME_SITE_MAP = {
 # Cookie helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _sanitize_cookie(c: dict, domain: str = ".google.com") -> Optional[dict]:
+    """
+    Alias used by agent.py — accepts an optional domain override and
+    delegates to _normalise_cookie.
+    """
+    if domain and not c.get("domain"):
+        c = {**c, "domain": domain}
+    return _normalise_cookie(c)
+
+
 def _normalise_cookie(c: dict) -> Optional[dict]:
     """
     Convert a raw cookie dict (from JSON export or file) into a
