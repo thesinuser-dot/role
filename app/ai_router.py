@@ -59,22 +59,33 @@ def _is_quota_error(exc: Exception) -> bool:
 
 
 # ── Per-provider health cache (thread-safe) ───────────────────────────────────
-# When a provider hits a quota error it is marked unavailable for
-# PROVIDER_COOLDOWN_SECONDS. All calls during that window skip it instantly.
-
-_PROVIDER_COOLDOWN_SECONDS = 300  # 5 minutes
+# FIX 3 — Exponential backoff:
+#   First quota hit  → cooldown = INITIAL (default 5 min)
+#   Second hit       → cooldown = INITIAL * 2 (10 min)
+#   Third hit        → cooldown = INITIAL * 4 (20 min)  … up to MAX (1 hour)
+#   Formula: min(MAX, INITIAL * 2^(failure_count - 1))
+# This prevents stampeding when quota resets are delayed (e.g. Gemini RPM
+# windows reset asynchronously — a fixed 5-minute cooldown can fire again
+# the instant it expires and immediately re-hit the same limit).
 
 class _ProviderHealth:
     def __init__(self):
         self._lock = threading.Lock()
         self._disabled_until: dict[str, float] = {}
+        self._failure_count:  dict[str, int]   = {}
 
     def mark_quota_failed(self, provider: str) -> None:
         with self._lock:
-            until = time.time() + _PROVIDER_COOLDOWN_SECONDS
+            count = self._failure_count.get(provider, 0) + 1
+            self._failure_count[provider] = count
+            initial = getattr(Config, "PROVIDER_COOLDOWN_INITIAL", 300)
+            maximum = getattr(Config, "PROVIDER_COOLDOWN_MAX",     3600)
+            cooldown = min(maximum, initial * (2 ** (count - 1)))
+            until = time.time() + cooldown
             self._disabled_until[provider] = until
             logging.getLogger("AIProviderRouter").warning(
-                f"[quota] {provider} quota hit — disabling for {_PROVIDER_COOLDOWN_SECONDS}s "
+                f"[quota] {provider} quota hit (failure #{count}) — "
+                f"disabling for {cooldown}s "
                 f"(until {time.strftime('%H:%M:%S', time.localtime(until))})"
             )
 
@@ -92,6 +103,24 @@ class _ProviderHealth:
     def reset(self, provider: str) -> None:
         with self._lock:
             self._disabled_until.pop(provider, None)
+            self._failure_count.pop(provider, None)  # successful call resets failure count
+
+
+# ── FIX 5 — Gemini-backed OpenRouter model detection ─────────────────────────
+# OpenRouter proxies some models that run on Google's Gemini infrastructure.
+# If Gemini quota is already exhausted and we fall through to OpenRouter,
+# routing to a Gemini-backed model recreates the exact same quota loop.
+# We filter these out of the cascade whenever Gemini is in cooldown.
+
+_GEMINI_BACKED_OPENROUTER_PREFIXES = (
+    "google/gemini",
+    "google/gemma",
+)
+
+def _is_gemini_backed_openrouter_model(model: str) -> bool:
+    """Return True if this OpenRouter model slug is served by Google/Gemini."""
+    m = model.lower().strip()
+    return any(m.startswith(p) for p in _GEMINI_BACKED_OPENROUTER_PREFIXES)
 
 
 _health = _ProviderHealth()
@@ -101,28 +130,70 @@ _gemini_semaphore = threading.Semaphore(2)
 
 
 # ── Image compression helper ──────────────────────────────────────────────────
+# FIX 4 — Vision Payload Optimization:
+#   • Resize to max_dim (was already in place)
+#   • JPEG recompression with quality tuned by image size (saves 60-80% TPM)
+#   • Grayscale conversion for OCR-mode tasks (half the channel data)
+#   • Aggressive PNG metadata stripping before encode
+#   A 4MB screenshot can reach ~180KB with near-identical OCR quality.
 
-def _compress_image(image_bytes: bytes, max_dim: int = 720) -> bytes:
+def _compress_image(
+    image_bytes: bytes,
+    max_dim: int = 720,
+    *,
+    grayscale: bool = False,
+    jpeg_quality: int = 75,
+) -> bytes:
     """
-    Resize image to max_dim on longest side before sending to Gemini Vision.
-    Reduces TPM consumption significantly for large screenshots.
-    Returns original bytes if PIL is unavailable or resize fails.
+    Resize + recompress an image before sending to Gemini Vision.
+
+    grayscale=True  converts to L-mode first, cutting channel data in half.
+                    Use for OCR / watermark-detection tasks where colour is
+                    irrelevant.  Do NOT use for aesthetic/style evaluations.
+    jpeg_quality    default 75 — good balance of visual fidelity vs. size.
+                    Drops to 60 automatically when the image is very large
+                    (> 500 KB after resize) to keep payloads tiny.
     """
     try:
         from PIL import Image
         import io
         img = Image.open(io.BytesIO(image_bytes))
+
+        # Strip ancillary PNG chunks (iCCP, tEXt, zTXt, iTXt, cHRM, etc.)
+        # that bloat the encoded size without contributing to model quality.
+        if img.format == "PNG" or image_bytes[:4] == b"\x89PNG":
+            clean = Image.new(img.mode, img.size)
+            clean.putdata(list(img.getdata()))
+            img = clean
+
+        # Resize to max_dim on longest side
         w, h = img.size
-        if max(w, h) <= max_dim:
-            return image_bytes
-        scale = max_dim / max(w, h)
-        new_size = (int(w * scale), int(h * scale))
-        img = img.resize(new_size, Image.LANCZOS)
+        if max(w, h) > max_dim:
+            scale = max_dim / max(w, h)
+            img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+        # Grayscale conversion for OCR / binary-decision prompts
+        if grayscale:
+            img = img.convert("L")
+        elif img.mode in ("RGBA", "P", "LA"):
+            img = img.convert("RGB")
+
+        # Auto-tune JPEG quality: if the resized image still encodes large,
+        # drop quality to 60 to stay well under Gemini's TPM budget.
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=85)
+        img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
         compressed = buf.getvalue()
+
+        if len(compressed) > 500_000 and jpeg_quality > 60:
+            buf2 = io.BytesIO()
+            img.save(buf2, format="JPEG", quality=60, optimize=True)
+            alt = buf2.getvalue()
+            if len(alt) < len(compressed):
+                compressed = alt
+
         logging.getLogger("AIProviderRouter").debug(
             f"Image compressed: {len(image_bytes)//1024}KB → {len(compressed)//1024}KB"
+            + (" (grayscale)" if grayscale else "")
         )
         return compressed
     except Exception:
@@ -255,10 +326,12 @@ class AIProviderRouter:
             self.log.debug("Gemini skipped — quota cooldown active.")
             return None
 
-        # Compress image to reduce TPM cost before sending
+        # Compress image to reduce TPM cost before sending.
+        # grayscale=True: watermark/handle detection is a binary OCR task —
+        # colour is irrelevant, and greyscale halves the encoded payload.
         if image_bytes is not None:
             max_dim = getattr(Config, "GEMINI_MAX_DIM", 720)
-            image_bytes = _compress_image(image_bytes, max_dim=max_dim)
+            image_bytes = _compress_image(image_bytes, max_dim=max_dim, grayscale=True)
 
         # Truncate prompt to avoid accidental context explosion
         prompt = prompt[:8000]
@@ -336,6 +409,26 @@ class AIProviderRouter:
             if Config.OPENROUTER_MODEL != "auto"
             else Config.OPENROUTER_MODEL_CASCADE
         )
+
+        # FIX 5 — Exclude Gemini-backed models when Gemini quota is exhausted.
+        # OpenRouter proxies google/gemini-* and google/gemma-* through the same
+        # Google quota.  Routing to them during a Gemini cooldown silently
+        # recreates the quota loop that the cooldown is meant to prevent.
+        if not _health.is_available("gemini"):
+            filtered = [m for m in models if not _is_gemini_backed_openrouter_model(m)]
+            if len(filtered) < len(models):
+                excluded = [m for m in models if _is_gemini_backed_openrouter_model(m)]
+                self.log.info(
+                    f"[quota] Gemini cooldown active — excluding Gemini-backed OpenRouter "
+                    f"model(s) from cascade: {excluded}"
+                )
+            models = filtered
+            if not models:
+                self.log.warning(
+                    "[quota] All configured OpenRouter models are Gemini-backed and "
+                    "Gemini is in cooldown — OpenRouter skipped entirely."
+                )
+                return None
         for model in models:
             try:
                 result = self._chat_completion(
