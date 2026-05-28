@@ -170,13 +170,11 @@ class TikTokPoster:
 
         self._cookies_path = self._resolve_cookies()
         if not self._cookies_path:
-            log.error(
-                "TikTok cookies not configured. "
-                "Set TIKTOK_COOKIES_FILE or TIKTOK_SESSION_ID. "
-                "TikTok posting disabled."
-            )
-            self.enabled = False
-            return
+            log.info("No TikTok cookies found — attempting login with email/password...")
+            if not self._manual_login_and_save_cookies():
+                log.error("TikTok login failed and no cookies configured — TikTok posting disabled.")
+                self.enabled = False
+                return
 
         log.info(
             f"TikTokPoster ready (auth_mode={self._auth_mode}, "
