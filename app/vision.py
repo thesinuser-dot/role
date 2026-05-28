@@ -27,43 +27,15 @@ from gemini_web_browser import GeminiWebBrowser
 
 
 class VisionEvaluator:
-    # الـ Prompt المطور لحل مشكلة الوجوه السينمائية والتفريق بين الـ Edits والـ Vlogs
     _GEMINI_PROMPT = (
-        "Role: You are a strict binary visual filter for a faceless/cinematic content aggregator. "
-        "Your sole task is to classify if this video frame is a high-quality EDIT/AESTHETIC clip or a PERSONAL/VLOG clip.\n\n"
-        
-        "CRITICAL RULE: Respond with EXACTLY ONE WORD: either 'PASSED' or 'FAILED'. "
-        "Do not include any punctuation, explanation, or extra characters. Fail closed if unsure.\n\n"
-        
-        "========================================= \n"
-        "REJECT AND OUTPUT 'FAILED' IF ANY OF THESE ARE TRUE:\n"
-        "========================================= \n"
-        "1. USER INTERFACE & BRANDING:\n"
-        "   - Contains platform watermarks (TikTok logo, Instagram Reels UI, YouTube shorts overlay).\n"
-        "   - Contains on-screen creator handles (e.g., @username) burned into the video as a permanent watermark.\n"
-        "2. FORMAT & QUALITY ISSUES:\n"
-        "   - Has horizontal black bars (Letterboxed) or vertical black bars (Pillarboxed).\n"
-        "   - Low resolution, blurry, pixelated, or poorly cropped.\n"
-        "3. PERSONAL / LIFESTYLE / UGC CONTENT:\n"
-        "   - Features an everyday person/influencer talking directly to the camera (Talking-head, Vlog style).\n"
-        "   - Looks like user-generated content (UGC), selfie-cam footage, GRWM (get ready with me), OOTD, or a lifestyle/travel vlog.\n"
-        "   - Shows real-life couples, family vlogs, or domestic personal context.\n"
-        "   - Features burned-in speech auto-captions/subtitles that follow a human voiceover (indicates a commentary vlog).\n\n"
-        
-        "========================================= \n"
-        "ACCEPT AND OUTPUT 'PASSED' ONLY IF ALL OF THESE ARE TRUE:\n"
-        "========================================= \n"
-        "1. NATIVE FORMAT: True native vertical 9:16 aspect ratio, edge-to-edge content without artificial borders.\n"
-        "2. NO BRANDING: 100% clean frame, free of third-party platform logos or creator handles.\n"
-        "3. ALLOWED CONTENT TYPES (Must match at least one):\n"
-        "   - Cinematic Edits: Scenes from movies, TV shows, or anime. NOTE: Fictional characters/actors (e.g., Homelander, Batman, Tommy Shelby) ARE fully allowed, even in close-ups, provided the footage is cinematic and NOT a personal vlog.\n"
-        "   - Automotive Footage: Professional/aesthetic car footage (drifting, rolling shots, car meets, luxury car close-ups).\n"
-        "   - Text/Quote Overlays: Deep, motivational, or relatable text written over a clean, artistic, or abstract background (e.g., night streets, rain, nature, scenery).\n"
-        "   - Gaming/AMV: High-quality gaming montages or anime music videos with clean transitions.\n\n"
-        
-        "Final Reminder: Look closely at the image. Is it a generic vlog/social media post? -> FAILED. "
-        "Is it a professional/faceless edit, cinematic clip, car video, or quote? -> PASSED.\n"
-        "Output ONLY 'PASSED' or 'FAILED'."
+        "You are a strict binary visual filter. "
+        "Check this video frame for the following ONLY.\n\n"
+        "OUTPUT 'FAILED' IF ANY OF THESE ARE VISIBLE:\n"
+        "- Platform logos or watermarks (TikTok, Instagram, YouTube, etc.)\n"
+        "- Creator handles or usernames burned into the frame (e.g., @username)\n"
+        "- Any text overlay identifying the original source or creator\n\n"
+        "OUTPUT 'PASSED' if none of the above are present.\n\n"
+        "CRITICAL: Reply with EXACTLY ONE WORD — 'PASSED' or 'FAILED'. Nothing else."
     )
 
     # Exceptions that indicate a transient Gemini error worth retrying
