@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import signal
 import time
 import tempfile
@@ -260,14 +261,24 @@ class TikTokPoster:
 
     def _validate_session(self) -> bool:
         """
-        Visit TikTok's For You page and confirm the user is logged in
-        before attempting an upload. Catches expired/invalid sessions early
-        so we don't waste a retry slot on a dead cookie.
+        FIX 6 — Deep session validation before every upload.
+
+        Three-stage check:
+          Stage 1 — For You page: fast login gate (redirect → dead session).
+          Stage 2 — Upload page probe: navigate to /upload, check for captcha,
+                    invisible challenges, and upload-ban indicators.  This catches
+                    soft account restrictions that the avatar/button check misses.
+          Stage 3 — DOM signal scan: explicit check for restriction banners,
+                    captcha overlays, and challenge modals on the upload page.
+
+        Returns True only if all stages pass.  Errors inside the validator
+        are non-fatal — we return True so a transient validator crash doesn't
+        permanently block all uploads.
         """
         try:
             from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-            log.info("TikTok: validating session before upload...")
+            log.info("TikTok: running deep session validation (3-stage)...")
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True)
                 ctx = browser.new_context(
@@ -277,73 +288,157 @@ class TikTokPoster:
                         "Chrome/124.0.0.0 Safari/537.36"
                     )
                 )
+
                 # Load cookies into context
                 if self._cookies_path and self._cookies_path.exists():
                     try:
                         import http.cookiejar as cj_mod
                         jar = cj_mod.MozillaCookieJar()
                         jar.load(str(self._cookies_path), ignore_discard=True, ignore_expires=True)
-                        pw_cookies = []
-                        for c in jar:
-                            pw_cookies.append({
-                                "name": c.name,
-                                "value": c.value,
-                                "domain": c.domain,
-                                "path": c.path,
-                                "secure": c.secure,
-                            })
+                        pw_cookies = [
+                            {
+                                "name": c.name, "value": c.value,
+                                "domain": c.domain, "path": c.path,
+                                "secure": bool(c.secure),
+                            }
+                            for c in jar
+                        ]
                         if pw_cookies:
                             ctx.add_cookies(pw_cookies)
                     except Exception as e:
                         log.debug(f"Session validation cookie load warning: {e}")
 
                 page = ctx.new_page()
+
+                # ── Stage 1: For You page login gate ──────────────────────────
                 try:
                     page.goto("https://www.tiktok.com/foryou", wait_until="domcontentloaded", timeout=20_000)
-                    time.sleep(3)
+                    time.sleep(2)
                     current_url = page.url
-
-                    # Redirect to login = session dead
                     if "login" in current_url or "signin" in current_url:
-                        log.warning("TikTok session validation FAILED — redirected to login page.")
+                        log.warning("TikTok stage-1 FAILED — redirected to login page.")
                         browser.close()
                         return False
-
-                    # Check for user avatar or upload button = logged in
-                    logged_in = False
-                    for sel in [
-                        "[data-e2e='nav-profile']",
-                        "button[data-e2e='upload-icon']",
-                        "[class*='avatar']",
-                        "[data-e2e='user-avatar']",
-                        "a[href*='/upload']",
-                    ]:
-                        try:
-                            el = page.query_selector(sel)
-                            if el and el.is_visible():
-                                logged_in = True
-                                break
-                        except Exception:
-                            pass
-
-                    browser.close()
-                    if logged_in:
-                        log.info("TikTok session validation passed ✅")
-                    else:
-                        log.warning("TikTok session validation uncertain — no avatar/upload button found.")
-                    return logged_in
-
                 except PWTimeout:
-                    log.warning("TikTok session validation timed out.")
+                    log.warning("TikTok stage-1 timed out.")
                     browser.close()
                     return False
 
+                # Check basic login signals (avatar / upload button)
+                logged_in = False
+                for sel in [
+                    "[data-e2e='nav-profile']",
+                    "button[data-e2e='upload-icon']",
+                    "[class*='avatar']",
+                    "[data-e2e='user-avatar']",
+                    "a[href*='/upload']",
+                ]:
+                    try:
+                        el = page.query_selector(sel)
+                        if el and el.is_visible():
+                            logged_in = True
+                            break
+                    except Exception:
+                        pass
+
+                if not logged_in:
+                    log.warning("TikTok stage-1 uncertain — no avatar/upload button found.")
+                    browser.close()
+                    return False
+
+                log.info("TikTok stage-1 passed ✅ — probing upload page...")
+
+                # ── Stage 2: Upload page probe (FIX 6 core) ───────────────────
+                # Navigate to the upload creation page and check if it loads
+                # normally.  A soft ban or upload restriction typically manifests
+                # as a redirect, a blank page, or a challenge modal here —
+                # not on the For You feed.
+                try:
+                    page.goto("https://www.tiktok.com/upload", wait_until="domcontentloaded", timeout=25_000)
+                    time.sleep(random.uniform(2.5, 4.0))  # FIX 2: humanise timing
+                    upload_url = page.url
+
+                    # Redirect to login from upload page = hard ban or expired session
+                    if "login" in upload_url or "signin" in upload_url:
+                        log.warning("TikTok stage-2 FAILED — upload page redirected to login.")
+                        browser.close()
+                        return False
+
+                    # Redirect to main feed from upload page = upload ban
+                    if upload_url.rstrip("/") in (
+                        "https://www.tiktok.com",
+                        "https://www.tiktok.com/foryou",
+                        "https://www.tiktok.com/following",
+                    ):
+                        log.warning(
+                            f"TikTok stage-2 FAILED — upload page redirected to feed "
+                            f"({upload_url}) which typically indicates an upload ban."
+                        )
+                        browser.close()
+                        return False
+
+                except PWTimeout:
+                    log.warning("TikTok stage-2 upload page timed out — treating as uncertain (pass).")
+                    # Don't hard-fail on a slow load — might just be network lag
+                    browser.close()
+                    return True
+
+                # ── Stage 3: DOM restriction / captcha scan ────────────────────
+                # Look for explicit challenge/captcha/ban signals on the upload page.
+                restriction_selectors = [
+                    # Captcha overlays
+                    "[class*='captcha']",
+                    "[id*='captcha']",
+                    "[data-e2e*='captcha']",
+                    # Challenge / verification modals
+                    "[class*='verify']",
+                    "[class*='challenge']",
+                    # Ban / restriction banners
+                    "[class*='restrict']",
+                    "[class*='violation']",
+                    "[class*='suspended']",
+                    # Generic error modal that blocks upload
+                    ".error-container",
+                    "[data-e2e='error-modal']",
+                ]
+                for sel in restriction_selectors:
+                    try:
+                        el = page.query_selector(sel)
+                        if el and el.is_visible():
+                            text = ""
+                            try:
+                                text = el.inner_text()[:200]
+                            except Exception:
+                                pass
+                            log.warning(
+                                f"TikTok stage-3 FAILED — restriction/captcha element "
+                                f"detected: {sel!r}  text={text!r}"
+                            )
+                            browser.close()
+                            return False
+                    except Exception:
+                        pass
+
+                browser.close()
+                log.info("TikTok session validation passed all 3 stages ✅")
+                return True
+
         except Exception as exc:
-            log.warning(f"TikTok session validation error (skipping check): {exc}")
-            # Don't block the upload if validation itself errors
-            return True
+            log.warning(f"TikTok session validation error (non-fatal, skipping check): {exc}")
+            return True  # validator crash must not block uploads
 
     def _do_upload(self, video_path: Path, caption: str) -> None:
+        # FIX 2 — Randomized upload timing.
+        # TikTok detects robotic upload patterns by measuring entropy in:
+        #   • Time between page load and first interaction
+        #   • Time between file selection and submit
+        #   • Mouse movement / scroll behaviour within the upload page
+        # Adding randomized pre-upload waits and a post-submit stabilization
+        # pause makes the timing distribution look like a real user.
+        pre_wait = random.uniform(2.5, 8.0)
+        log.info(f"[TikTok] Pre-upload human timing delay: {pre_wait:.1f}s")
+        time.sleep(pre_wait)
+
         upload_video(
             filename=str(video_path),
             description=caption,
@@ -351,6 +446,12 @@ class TikTokPoster:
             headless=Config.TIKTOK_HEADLESS,
             schedule=None,
         )
+
+        # Post-upload stabilization: give TikTok's processing pipeline time to
+        # register the submission before we close the browser context.
+        post_wait = random.uniform(3.0, 7.0)
+        log.info(f"[TikTok] Post-upload stabilization delay: {post_wait:.1f}s")
+        time.sleep(post_wait)
 
     def _push_cookies_to_github_secret(self, cookie_path: Path) -> None:
         import base64
@@ -586,8 +687,10 @@ class TikTokPoster:
                     f"failed: {exc}"
                 )
                 if attempt < Config.TIKTOK_MAX_RETRIES:
-                    sleep_s = 2 ** attempt
-                    log.info(f"[TikTok] Retrying in {sleep_s}s...")
+                    base_sleep = 2 ** attempt
+                    jitter = random.uniform(0.5, 2.5)  # FIX 2: jitter prevents robotic retry cadence
+                    sleep_s = base_sleep + jitter
+                    log.info(f"[TikTok] Retrying in {sleep_s:.1f}s...")
                     time.sleep(sleep_s)
 
         log.error(
