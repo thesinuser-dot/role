@@ -318,32 +318,64 @@ class VisionEvaluator:
         return False, f"Gemini API error (fail-closed): {last_exc}"
 
     def _ask_gemini_web(self, compressed: bytes, reason: str = "") -> Tuple[bool, str]:
-        """Ask GeminiWebBrowser and return a (passed, reason_str) tuple."""
+        """Ask GeminiWebBrowser, fall back to HF LLaVA if it fails."""
+        tag = f" ({reason})" if reason else ""
+
+        if self._gemini_web_browser is not None:
+            try:
+                response_text, snap = self._gemini_web_browser.ask(
+                    self._GEMINI_PROMPT,
+                    image_bytes=compressed,
+                )
+                if snap and self._notifier:
+                    try:
+                        self._notifier.send_photo(
+                            snap,
+                            caption=f"🌐 <b>Gemini Web Vision Check</b>{tag}",
+                        )
+                    except Exception as se:
+                        self.log.warning(f"Could not send Gemini Web screenshot: {se}")
+                if response_text:
+                    upper = response_text.upper()
+                    if "PASSED" in upper:
+                        return True, f"Gemini Web Vision: PASSED{tag}"
+                    if "FAILED" in upper:
+                        return False, f"Gemini Web Vision: FAILED{tag}"
+                self.log.warning("Gemini Web no usable response — trying HF LLaVA...")
+            except Exception as we:
+                self.log.warning(f"GeminiWebBrowser failed: {we} — trying HF LLaVA...")
+        else:
+            self.log.info("Gemini Web not available — trying HF LLaVA directly...")
+
+        return self._ask_hf_llava(compressed, reason=reason)
+
+    def _ask_hf_llava(self, compressed: bytes, reason: str = "") -> Tuple[bool, str]:
+        """Call the HF Space LLaVA API. Returns (passed, reason_str)."""
         tag = f" ({reason})" if reason else ""
         try:
-            response_text, snap = self._gemini_web_browser.ask(
+            from ollama_vision import is_configured, ask_vision
+            if not is_configured():
+                self.log.warning("HF LLaVA not configured (OLLAMA_BASE_URL not set) — fail-closed")
+                return False, f"HF LLaVA: not configured (fail-closed){tag}"
+
+            text, ok = ask_vision(
                 self._GEMINI_PROMPT,
                 image_bytes=compressed,
+                max_tokens=16,
             )
-            if snap and self._notifier:
-                try:
-                    self._notifier.send_photo(
-                        snap,
-                        caption=f"🌐 <b>Gemini Web Vision Check</b>{tag}",
-                    )
-                except Exception as se:
-                    self.log.warning(f"Could not send Gemini Web screenshot: {se}")
-            if response_text:
-                upper = response_text.upper()
+            if ok and text:
+                upper = text.upper()
                 if "PASSED" in upper:
-                    return True, f"Gemini Web Vision: PASSED{tag}"
+                    self.log.info(f"HF LLaVA: PASSED{tag}")
+                    return True, f"HF LLaVA Vision: PASSED{tag}"
                 if "FAILED" in upper:
-                    return False, f"Gemini Web Vision: FAILED{tag}"
-            self.log.warning("Gemini Web returned no usable response — fail-closed")
-            return False, f"Gemini Web: no usable response (fail-closed){tag}"
-        except Exception as we:
-            self.log.error(f"GeminiWebBrowser fallback failed: {we}")
-            return False, f"Gemini Web error (fail-closed): {we}"
+                    self.log.info(f"HF LLaVA: FAILED{tag}")
+                    return False, f"HF LLaVA Vision: FAILED{tag}"
+            self.log.warning(f"HF LLaVA no usable response: {text!r} — fail-closed")
+            return False, f"HF LLaVA: no usable response (fail-closed){tag}"
+        except Exception as exc:
+            self.log.error(f"HF LLaVA fallback failed: {exc}")
+            return False, f"HF LLaVA error (fail-closed): {exc}{tag}"
 
     # ── Startup self-test ────────────────────────────────────────────────────
 
