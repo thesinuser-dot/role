@@ -1,13 +1,26 @@
 #!/usr/bin/env python3
 # ─────────────────────────────────────────────────────────────────────────────
-# gemini_web_browser.py — Gemini Web fallback reusing the existing browser tab
+# gemini_web_browser.py — Gemini Web fallback (browser-based, no API key)
 #
-# Fixes applied (2026-05):
-#   • NEVER mutate host-only cookie domains — preserve exact domain from export
-#   • Validate required Google auth cookies before attempting login
-#   • Expanded login-failure detection (consent/ogs/myaccount/reauth/challenge)
-#   • sameSite values sanitised without touching domain field
-#   • Expired cookies stay expired — no forced 2147483647 revival
+# How it works:
+#   1. Injects Google cookies exported from a real Chrome session.
+#   2. Navigates to gemini.google.com/app.
+#   3. Checks login status — if not logged in, aborts with a clear message.
+#      (Password login is intentionally NOT attempted: Google hard-blocks
+#       automated browsers from the OAuth sign-in flow with the
+#       "Couldn't sign you in" screen.  Only cookies work.)
+#   4. Pastes the reel screenshot via file-chooser or clipboard.
+#   5. Types the prompt and waits for the response.
+#
+# Cookie setup:
+#   - Export cookies from a logged-in Chrome tab on gemini.google.com
+#     using the Cookie-Editor extension (Export → JSON).
+#   - Paste the JSON array as the GEMINI_COOKIES GitHub secret.
+#   - The write_google_cookies.py script normalises this into
+#     ~/.secrets/gemini_cookies.json at workflow start.
+#   - Pass the file path OR the raw JSON string as cookies_raw.
+#
+# Required cookies:  __Secure-1PSID, __Secure-3PSID, SAPISID, SID
 # ─────────────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
@@ -18,21 +31,21 @@ import os
 import subprocess
 import tempfile
 import time
+from pathlib import Path
 from typing import Optional, Tuple
 
 log = logging.getLogger("GeminiWebBrowser")
 
-GEMINI_URL       = "https://gemini.google.com/app"
-GOOGLE_LOGIN_URL = "https://accounts.google.com/signin/v2/identifier"
+GEMINI_URL = "https://gemini.google.com/app"
 
 # Playwright only accepts these three sameSite values
 _VALID_SAME_SITE = {"Strict", "Lax", "None"}
 
-# These cookies must be present for Gemini to authenticate reliably
-_REQUIRED_GEMINI_COOKIES = {"__Secure-1PSID", "SAPISID", "SID"}
+# These must be present for Gemini to authenticate
+_REQUIRED_COOKIES = {"__Secure-1PSID", "SAPISID", "SID"}
 
-# URL patterns that indicate Google is NOT showing the chat UI
-_NOT_LOGGED_IN_URLS = (
+# URL fragments that mean we are NOT on the chat UI
+_GATE_URL_PATTERNS = (
     "accounts.google.com",
     "consent.google.com",
     "ogs.google.com/widget",
@@ -41,82 +54,146 @@ _NOT_LOGGED_IN_URLS = (
     "reauth",
     "signin",
     "checkconnection",
-)
-
-# URL patterns that mean Google has hard-blocked this browser/app from signing
-# in — retrying or entering a password will never work.  Only fresh cookies
-# exported from a real Chrome session will fix this.
-_BLOCKED_BROWSER_URLS = (
     "disallowed_useragent",
     "errorCode=disallowed",
-    "oauth2/v2/auth",           # OAuth redirect that ends in the blocked screen
+    "oauth2/v2/auth",
 )
-_BLOCKED_BROWSER_TEXT = (
+
+# Page text fragments that indicate Google blocked the browser from signing in
+_BLOCKED_TEXT_PATTERNS = (
     "couldn't sign you in",
+    "couldn\u2019t sign you in",
     "this browser or app may not be secure",
-    "couldn\u2019t sign you in",   # curly apostrophe variant
 )
 
+_SAME_SITE_MAP = {
+    "no_restriction": "None",
+    "norestriction":  "None",
+    "lax":            "Lax",
+    "strict":         "Strict",
+    "none":           "None",
+    "unspecified":    "None",
+    "":               "None",
+}
 
-def _sanitize_cookie(c: dict, default_domain: str) -> dict:
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cookie helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _normalise_cookie(c: dict) -> Optional[dict]:
     """
-    Normalise a raw cookie dict so Playwright's add_cookies() won't crash.
+    Convert a raw cookie dict (from JSON export or file) into a
+    Playwright-compatible dict.  Returns None if the cookie has no name.
 
-    KEY FIX: Domain is preserved exactly as exported.
-    Prepending a dot to host-only cookies (e.g. accounts.google.com →
-    .accounts.google.com) changes browser behaviour and breaks Google auth.
-    We only add a leading dot when the original domain is genuinely a
-    subdomain wildcard (already starts with dot) OR when no domain is given.
+    Domain is NEVER mutated — Google auth is extremely sensitive to exact
+    domain values (host-only vs subdomain-wildcard).
     """
-    # sameSite: map any export value → Strict | Lax | None
-    raw_ss = str(c.get("sameSite") or c.get("same_site") or "").lower().replace("_", "").replace("-", "")
-    if raw_ss == "strict":
-        same_site = "Strict"
-    elif raw_ss == "lax":
-        same_site = "Lax"
-    else:
-        same_site = "None"  # 'no_restriction', 'unspecified', empty → None
+    name  = str(c.get("name",  "")).strip()
+    value = str(c.get("value", ""))
+    if not name:
+        return None
 
-    # expires: must be a positive int; keep -1/None as session cookie
-    raw_exp = c.get("expirationDate") or c.get("expires")
-    try:
-        expires = int(float(raw_exp)) if raw_exp is not None else -1
-        # Don't force-revive expired cookies — keep them as-is so Google
-        # sees the real expiry instead of a bogus far-future timestamp
-        if expires <= 0:
-            expires = -1
-    except (TypeError, ValueError):
-        expires = -1
-
-    # ── KEY FIX: preserve domain exactly; never force-add a dot prefix ──
-    domain = str(c.get("domain") or default_domain)
-    # Only strip "http(s)://" prefixes — never add/remove dots
+    domain = str(c.get("domain", ".google.com"))
     if domain.startswith("http"):
         from urllib.parse import urlparse
-        domain = urlparse(domain).hostname or default_domain
+        domain = urlparse(domain).hostname or ".google.com"
 
-    cookie: dict = {
-        "name":     str(c.get("name", "")),
-        "value":    str(c.get("value", "")),
+    ss_raw   = str(c.get("sameSite") or c.get("same_site") or "").lower()\
+                 .replace("_", "").replace("-", "").replace(" ", "")
+    same_site = _SAME_SITE_MAP.get(ss_raw, "None")
+
+    raw_exp = c.get("expirationDate") or c.get("expires")
+    if raw_exp is None:
+        expires = -1
+    else:
+        try:
+            expires = int(float(raw_exp))
+            if expires <= 0:
+                expires = -1
+        except (TypeError, ValueError):
+            expires = -1
+
+    entry: dict = {
+        "name":     name,
+        "value":    value,
         "domain":   domain,
         "path":     str(c.get("path") or "/"),
         "secure":   bool(c.get("secure", True)),
         "httpOnly": bool(c.get("httpOnly", False)),
         "sameSite": same_site,
     }
-    # Only include 'expires' if it's a valid positive timestamp
     if expires > 0:
-        cookie["expires"] = expires
+        entry["expires"] = expires
+    return entry
 
-    return cookie
 
+def _parse_cookies_raw(raw: str) -> list:
+    """
+    Parse a cookie string into a list of Playwright-compatible dicts.
+    Accepts JSON array or semicolon-separated key=value string.
+    """
+    raw = raw.strip()
+    if not raw:
+        return []
+
+    # Try JSON array first
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            result = []
+            for c in parsed:
+                entry = _normalise_cookie(c)
+                if entry:
+                    result.append(entry)
+            return result
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Fallback: semicolon key=value
+    result = []
+    for part in raw.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        k, _, v = part.partition("=")
+        entry = _normalise_cookie({"name": k.strip(), "value": v.strip(), "domain": ".google.com"})
+        if entry:
+            result.append(entry)
+    return result
+
+
+def _load_cookies_from_file(path: str) -> list:
+    """Load cookies from a JSON file written by write_google_cookies.py."""
+    try:
+        data = json.loads(Path(path).read_text())
+        if isinstance(data, list):
+            result = []
+            for c in data:
+                entry = _normalise_cookie(c)
+                if entry:
+                    result.append(entry)
+            return result
+    except Exception as exc:
+        log.warning(f"Could not load cookies from {path}: {exc}")
+    return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main class
+# ─────────────────────────────────────────────────────────────────────────────
 
 class GeminiWebBrowser:
+    """
+    Uses an existing Playwright BrowserContext + Page to query Gemini Web.
+    Call set_context() and set_page() before ask().
+    """
+
     def __init__(self, cookies_raw: str = ""):
         self._cookies_raw = cookies_raw
         self._notifier    = None
-        self._ctx         = None   # injected via set_context()
-        self._page        = None   # injected via set_page()
+        self._ctx         = None
+        self._page        = None
 
     def set_notifier(self, notifier) -> None:
         self._notifier = notifier
@@ -127,90 +204,95 @@ class GeminiWebBrowser:
 
     def set_page(self, page) -> None:
         self._page = page
-        log.info("GeminiWebBrowser: existing Page injected.")
+        log.info("GeminiWebBrowser: Page injected.")
 
-    # ── Cookie helpers ────────────────────────────────────────────────────────
+    # ── Cookies ───────────────────────────────────────────────────────────────
 
-    def _parse_cookies(self) -> list:
-        raw = self._cookies_raw.strip()
-        if not raw:
-            return []
-        cookies = []
-        # Try JSON array first
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, list):
-                for c in parsed:
-                    if c.get("name"):
-                        cookies.append(_sanitize_cookie(c, ".google.com"))
-                if cookies:
-                    return cookies
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-        # Fallback: semicolon-separated key=value string
-        for part in raw.replace(";", "\n").splitlines():
-            part = part.strip()
-            if "=" in part:
-                k, _, v = part.partition("=")
-                cookies.append(_sanitize_cookie({
-                    "name": k.strip(), "value": v.strip(),
-                    "domain": ".google.com",
-                }, ".google.com"))
-        return cookies
-
-    def _validate_required_cookies(self, cookies: list) -> bool:
+    def _get_cookies(self) -> list:
         """
-        Check that the critical Google auth cookies are present.
-        Gemini silently redirects to login if any of these are missing.
+        Return the best available cookie list, in priority order:
+          1. Normalised file at ~/.secrets/gemini_cookies.json
+          2. Raw string passed to __init__ (GEMINI_COOKIES env var)
         """
-        present = {c["name"] for c in cookies}
-        missing = _REQUIRED_GEMINI_COOKIES - present
-        if missing:
-            log.warning(
-                f"Gemini cookies missing critical auth cookies: {missing}. "
-                "Login will likely fail. Export cookies from a fresh logged-in "
-                "Chrome session and ensure __Secure-1PSID, SAPISID, and SID are included."
-            )
-            return False
-        return True
+        file_path = os.path.expanduser("~/.secrets/gemini_cookies.json")
+        if os.path.exists(file_path):
+            cookies = _load_cookies_from_file(file_path)
+            if cookies:
+                log.info(f"Loaded {len(cookies)} cookies from {file_path}")
+                return cookies
+            log.warning(f"Cookie file exists but is empty/invalid: {file_path}")
+
+        if self._cookies_raw.strip():
+            cookies = _parse_cookies_raw(self._cookies_raw)
+            if cookies:
+                log.info(f"Parsed {len(cookies)} cookies from GEMINI_COOKIES env var.")
+                return cookies
+
+        return []
 
     def _inject_cookies(self) -> int:
-        cookies = self._parse_cookies()
-        if not cookies or not self._ctx:
+        """Inject cookies into the browser context. Returns number injected."""
+        if not self._ctx:
             return 0
 
-        # Warn if critical cookies are missing (but still try — partial is better than nothing)
-        self._validate_required_cookies(cookies)
+        cookies = self._get_cookies()
+        if not cookies:
+            log.warning(
+                "No Gemini cookies available. "
+                "Export cookies from gemini.google.com using Cookie-Editor → Export → JSON "
+                "and set as GEMINI_COOKIES secret."
+            )
+            return 0
+
+        # Warn if critical cookies are missing
+        present = {c["name"] for c in cookies}
+        missing = _REQUIRED_COOKIES - present
+        if missing:
+            log.warning(
+                f"Missing critical Google auth cookies: {sorted(missing)}. "
+                "Gemini will likely redirect to login. "
+                "Re-export cookies from a fresh Chrome session on gemini.google.com."
+            )
 
         try:
             self._ctx.add_cookies(cookies)
-            log.info(f"Injected {len(cookies)} Gemini cookie(s).")
+            log.info(f"Injected {len(cookies)} Google cookie(s).")
             return len(cookies)
         except Exception as exc:
-            log.warning(f"Cookie injection error: {exc} — skipping cookies.")
+            log.warning(f"Cookie injection failed: {exc}")
             return 0
 
     # ── Login detection ───────────────────────────────────────────────────────
 
-    def _is_logged_in(self) -> bool:
+    def _is_blocked_browser(self) -> bool:
         """
-        Check whether the current page is the Gemini chat UI.
-
-        KEY FIX: Google routes through many non-login URLs before showing
-        the chat. We check for ANY known gate/challenge URL, not just
-        accounts.google.com.
+        Return True if Google has shown the hard-blocked browser screen:
+        "Couldn't sign you in — This browser or app may not be secure."
+        When this happens, NO amount of retrying or credential entry helps.
+        The only fix is to set fresh cookies from a real Chrome session.
         """
         try:
-            current_url = self._page.url or ""
+            url     = self._page.url or ""
+            content = self._page.content().lower()
+            if any(p in url for p in ("disallowed_useragent", "errorCode=disallowed")):
+                return True
+            if any(t in content for t in _BLOCKED_TEXT_PATTERNS):
+                return True
+        except Exception:
+            pass
+        return False
 
-            # Any known Google auth/challenge URL = not logged in
-            for pattern in _NOT_LOGGED_IN_URLS:
-                if pattern in current_url:
-                    log.debug(f"Login check: gate URL detected ({pattern}) in {current_url}")
-                    return False
+    def _is_logged_in(self) -> bool:
+        """Return True only when the Gemini chat input is visible."""
+        try:
+            url = self._page.url or ""
 
-            # If a sign-in button is explicitly visible, not logged in
+            # Any known gate/auth URL = not logged in
+            if any(p in url for p in _GATE_URL_PATTERNS):
+                log.debug(f"Login check: gate URL detected in {url}")
+                return False
+
+            # Sign-in button visible = not logged in
             for sel in [
                 "a[href*='accounts.google.com/signin']",
                 "a[aria-label*='Sign in']",
@@ -225,7 +307,7 @@ class GeminiWebBrowser:
                 except Exception:
                     pass
 
-            # Verify Gemini chat input is actually present
+            # Chat input present = logged in
             for sel in [
                 "rich-textarea div[contenteditable='true']",
                 "div[contenteditable='true'][role='textbox']",
@@ -238,172 +320,12 @@ class GeminiWebBrowser:
                 except Exception:
                     pass
 
-            # No chat input found but no gate detected — uncertain; treat as not logged in
-            log.debug(f"Login check: no chat input found on {current_url}")
+            log.debug(f"Login check uncertain — no chat input found on {url}")
             return False
         except Exception:
             return False
 
-    def _manual_login(self) -> bool:
-        """
-        Attempt to log in to Gemini via Google account credentials.
-
-        Google blocks automated browsers from the OAuth sign-in flow with the
-        "Couldn't sign you in — This browser or app may not be secure" screen.
-        When that screen is detected we abort immediately and instruct the user
-        to export cookies from a real Chrome session instead of wasting time
-        retrying a login that will never succeed.
-
-        Password-based login is kept as a last resort for cases where Google
-        hasn't yet blocked this UA, but the recommended path is always cookies.
-        """
-        page = self._page
-
-        # Check if we've already hit the hard-blocked screen
-        try:
-            current_url  = page.url or ""
-            page_content = page.content().lower()
-
-            url_blocked  = any(p in current_url for p in _BLOCKED_BROWSER_URLS)
-            text_blocked = any(t in page_content for t in _BLOCKED_BROWSER_TEXT)
-
-            if url_blocked or text_blocked:
-                log.error(
-                    "Google blocked this browser from signing in "
-                    "('Couldn't sign you in — This browser or app may not be secure'). "
-                    "Password login will NOT work from an automated browser. "
-                    "FIX: export cookies from a real logged-in Chrome session on "
-                    "gemini.google.com using the Cookie-Editor extension, paste the "
-                    "JSON array as the GEMINI_COOKIES GitHub secret, then re-run."
-                )
-                return False
-        except Exception:
-            pass
-
-        # Fall back to password login (works only if Google hasn't blocked UA)
-        try:
-            from config import Config
-            email    = Config.GEMINI_EMAIL.strip()
-            password = Config.GEMINI_PASSWORD.strip()
-        except Exception:
-            email = password = ""
-
-        if not email or not password:
-            log.warning(
-                "GEMINI_EMAIL/GEMINI_PASSWORD not set — cannot attempt password login. "
-                "Set the GEMINI_COOKIES secret with cookies exported from a real Chrome "
-                "session on gemini.google.com to authenticate without a password."
-            )
-            return False
-
-        log.info("Attempting manual Google/Gemini login (password fallback)...")
-        try:
-            from playwright.sync_api import TimeoutError as PWTimeout
-
-            log.info("Gemini login step 1: opening gemini.google.com/app...")
-            page.goto(GEMINI_URL, wait_until="domcontentloaded", timeout=30_000)
-            time.sleep(3)
-
-            # Abort immediately if we hit the blocked-browser screen
-            try:
-                content = page.content().lower()
-                if any(t in content for t in _BLOCKED_BROWSER_TEXT) or \
-                   any(p in (page.url or "") for p in _BLOCKED_BROWSER_URLS):
-                    log.error(
-                        "Blocked-browser screen appeared after navigation. "
-                        "Password login cannot proceed — update GEMINI_COOKIES instead."
-                    )
-                    return False
-            except Exception:
-                pass
-
-            log.info("Gemini login step 2: clicking Sign in...")
-            for sel in [
-                "a:has-text('Sign in')",
-                "button:has-text('Sign in')",
-                "[href*='accounts.google.com/signin']",
-            ]:
-                try:
-                    page.click(sel, timeout=6_000)
-                    break
-                except PWTimeout:
-                    continue
-            time.sleep(2)
-
-            # Check again after clicking Sign in
-            try:
-                content = page.content().lower()
-                if any(t in content for t in _BLOCKED_BROWSER_TEXT):
-                    log.error(
-                        "Blocked-browser screen appeared after clicking Sign in. "
-                        "Update GEMINI_COOKIES secret with fresh Chrome cookies."
-                    )
-                    return False
-            except Exception:
-                pass
-
-            log.info("Gemini login step 3: filling Google email...")
-            page.wait_for_selector("input[type='email']", timeout=15_000)
-            page.fill("input[type='email']", email)
-            time.sleep(0.5)
-            page.keyboard.press("Enter")
-            time.sleep(3)
-
-            log.info("Gemini login step 4: filling Google password...")
-            page.wait_for_selector("input[type='password']", timeout=15_000)
-            page.fill("input[type='password']", password)
-            time.sleep(0.5)
-            page.keyboard.press("Enter")
-            time.sleep(6)
-
-            if "gemini.google.com" not in page.url:
-                log.info("Gemini login step 5: navigating back to Gemini...")
-                page.goto(GEMINI_URL, wait_until="domcontentloaded", timeout=30_000)
-                time.sleep(4)
-
-            if self._is_logged_in():
-                log.info("Manual Gemini login succeeded ✅")
-                try:
-                    cookies = page.context.cookies()
-                    log.info(f"Gemini: captured {len(cookies)} cookies after login.")
-                except Exception:
-                    pass
-                return True
-
-            log.error("Manual Gemini login failed — still not showing chat UI.")
-            return False
-        except Exception as exc:
-            log.error(f"Manual login error: {type(exc).__name__}: {exc}")
-            return False
-
-    # ── Image clipboard paste ─────────────────────────────────────────────────
-
-    def _put_image_on_clipboard(self, image_bytes: bytes, tmp_path: str) -> bool:
-        with open(tmp_path, "wb") as f:
-            f.write(image_bytes)
-        try:
-            r = subprocess.run(
-                ["xclip", "-selection", "clipboard", "-t", "image/png", "-i", tmp_path],
-                capture_output=True, timeout=5,
-            )
-            if r.returncode == 0:
-                log.info("Image on clipboard via xclip ✅")
-                return True
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
-        try:
-            with open(tmp_path, "rb") as f:
-                r2 = subprocess.run(
-                    ["wl-copy", "--type", "image/png"],
-                    input=f.read(), capture_output=True, timeout=5,
-                )
-            if r2.returncode == 0:
-                log.info("Image on clipboard via wl-copy ✅")
-                return True
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
-        log.warning("xclip and wl-copy both unavailable.")
-        return False
+    # ── Image upload ──────────────────────────────────────────────────────────
 
     _INPUT_SELS = [
         "rich-textarea div[contenteditable='true']",
@@ -428,11 +350,43 @@ class GeminiWebBrowser:
         "button[jsname][aria-label*='add' i]",
     ]
 
+    def _put_image_on_clipboard(self, image_bytes: bytes, tmp_path: str) -> bool:
+        with open(tmp_path, "wb") as f:
+            f.write(image_bytes)
+        for cmd in (
+            ["xclip", "-selection", "clipboard", "-t", "image/png", "-i", tmp_path],
+            None,  # wl-copy handled separately below
+        ):
+            if cmd:
+                try:
+                    r = subprocess.run(cmd, capture_output=True, timeout=5)
+                    if r.returncode == 0:
+                        log.info("Image on clipboard via xclip ✅")
+                        return True
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    pass
+            else:
+                try:
+                    with open(tmp_path, "rb") as f:
+                        r2 = subprocess.run(
+                            ["wl-copy", "--type", "image/png"],
+                            input=f.read(), capture_output=True, timeout=5,
+                        )
+                    if r2.returncode == 0:
+                        log.info("Image on clipboard via wl-copy ✅")
+                        return True
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    pass
+        log.warning("xclip and wl-copy both unavailable.")
+        return False
+
     def _close_any_open_dialog(self) -> None:
         try:
             page = self._page
-            for sel in ["button[aria-label='Close']", "button[aria-label='Cancel']",
-                        "[role='dialog'] button", "mat-dialog-container button"]:
+            for sel in [
+                "button[aria-label='Close']", "button[aria-label='Cancel']",
+                "[role='dialog'] button", "mat-dialog-container button",
+            ]:
                 try:
                     el = page.query_selector(sel)
                     if el and el.is_visible():
@@ -455,6 +409,7 @@ class GeminiWebBrowser:
                 f.write(image_bytes)
             page = self._page
 
+            # Try attach button + file chooser
             for btn_sel in self._ATTACH_BTN_SELS:
                 try:
                     btn = page.query_selector(btn_sel)
@@ -473,13 +428,14 @@ class GeminiWebBrowser:
                             try:
                                 inp.set_input_files(tmp_path)
                                 time.sleep(2)
-                                log.info(f"Image uploaded via {btn_sel} + file input ✅")
+                                log.info(f"Image uploaded via hidden file input ✅")
                                 return True
                             except Exception:
                                 continue
                 except Exception:
                     continue
 
+            # Try all hidden file inputs directly
             for inp in page.query_selector_all("input[type='file']"):
                 try:
                     inp.set_input_files(tmp_path)
@@ -489,6 +445,7 @@ class GeminiWebBrowser:
                 except Exception:
                     continue
 
+            # Clipboard paste fallback
             if self._put_image_on_clipboard(image_bytes, tmp_path):
                 for sel in self._INPUT_SELS:
                     try:
@@ -498,7 +455,7 @@ class GeminiWebBrowser:
                             time.sleep(0.3)
                             page.keyboard.press("Control+v")
                             time.sleep(2)
-                            log.info("Image pasted via xclip Ctrl+V ✅")
+                            log.info("Image pasted via clipboard Ctrl+V ✅")
                             return True
                     except Exception:
                         continue
@@ -536,20 +493,48 @@ class GeminiWebBrowser:
 
         try:
             injected = self._inject_cookies()
-            log.info(f"Navigating to Gemini (existing tab, {injected} cookies pre-injected)...")
+            log.info(f"Navigating to Gemini ({injected} cookies pre-injected)...")
             page.goto(GEMINI_URL, wait_until="domcontentloaded", timeout=30_000)
             time.sleep(3)
 
+            # Check for the hard-blocked browser screen FIRST
+            if self._is_blocked_browser():
+                log.error(
+                    "Google blocked this browser from signing in "
+                    "(\"Couldn't sign you in — This browser or app may not be secure\"). "
+                    "Password login will NOT work. "
+                    "FIX: Export cookies from a logged-in Chrome session on "
+                    "gemini.google.com using Cookie-Editor → Export → JSON, "
+                    "then set as the GEMINI_COOKIES GitHub secret and re-run."
+                )
+                snap = page.screenshot(type="jpeg", quality=80)
+                self._send_screenshot(
+                    snap,
+                    "❌ Gemini: Google blocked sign-in.\n\n"
+                    "FIX: Export cookies from Chrome on gemini.google.com "
+                    "(Cookie-Editor → Export → JSON) and set as GEMINI_COOKIES secret.",
+                )
+                return None, snap
+
             if not self._is_logged_in():
-                log.warning("Gemini: cookies didn't authenticate — trying manual login...")
-                if not self._manual_login():
-                    log.error("Gemini: manual login also failed — cannot proceed.")
-                    snap = page.screenshot(type="jpeg", quality=80)
-                    self._send_screenshot(snap, "❌ Gemini: login failed.\n\nFIX: Export cookies from a logged-in Chrome session on gemini.google.com using the Cookie-Editor extension, paste the JSON array as the GEMINI_COOKIES GitHub secret, then re-run.\n\nPassword login does NOT work from automated browsers — Google blocks it.")
-                    return None, snap
+                log.error(
+                    "Gemini cookies did not authenticate. "
+                    "Re-export cookies from a fresh Chrome session on gemini.google.com "
+                    "and update the GEMINI_COOKIES secret."
+                )
+                snap = page.screenshot(type="jpeg", quality=80)
+                self._send_screenshot(
+                    snap,
+                    "❌ Gemini: not logged in after cookie injection.\n\n"
+                    "Re-export cookies from Chrome on gemini.google.com "
+                    "(Cookie-Editor → Export → JSON) and update GEMINI_COOKIES secret.",
+                )
+                return None, snap
+
+            log.info("Gemini login confirmed ✅")
 
             if image_bytes:
-                log.info("Pasting reel screenshot into Gemini...")
+                log.info("Uploading reel screenshot to Gemini...")
                 self._paste_image_into_gemini(image_bytes)
                 self._close_any_open_dialog()
                 time.sleep(1)
@@ -581,7 +566,8 @@ class GeminiWebBrowser:
             log.info("Prompt submitted — waiting for response...")
 
             response_text = None
-            for _ in range(30):
+            deadline = time.time() + timeout_ms / 1000
+            while time.time() < deadline:
                 time.sleep(1)
                 for sel in [
                     "model-response .markdown",
@@ -607,7 +593,7 @@ class GeminiWebBrowser:
                     break
 
             if response_text:
-                log.info(f"Gemini response: {response_text[:200]!r}")
+                log.info(f"Gemini response ({len(response_text)} chars): {response_text[:200]!r}")
             else:
                 log.warning("No response text extracted from Gemini.")
 
@@ -619,7 +605,7 @@ class GeminiWebBrowser:
                 out = Config.SCREENSHOT_DIR / f"gemini_web_{int(time.time())}.jpg"
                 out.write_bytes(snap)
             except Exception as exc:
-                log.warning(f"Could not save screenshot: {exc}")
+                log.debug(f"Could not save screenshot: {exc}")
 
             self._send_screenshot(
                 snap,
