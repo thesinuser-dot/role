@@ -6,8 +6,14 @@ The secret may be:
   - A raw Netscape file (tab-separated lines)
   - A JSON array (from a browser cookie-export extension)
   - Either of the above encoded as base64
+
+Fixes applied (2026-05):
+  • NEVER force-add dot prefix to host-only cookie domains
+  • NEVER revive expired cookies with fake 2147483647 timestamp
+  • Expired cookies written with their real expiry so TikTok can reject them
+    properly rather than receiving an impossible future timestamp
 """
-import os, json, base64
+import os, json, base64, time
 
 raw = os.environ["TIKTOK_COOKIES"].strip()
 out = os.path.expanduser("~/.secrets/tiktok_cookies.txt")
@@ -26,19 +32,56 @@ try:
     cookies = json.loads(raw)
     assert isinstance(cookies, list)
     count = 0
+    now = int(time.time())
+    skipped_expired = 0
+
     for c in cookies:
+        name  = c.get("name", "")
+        value = c.get("value", "")
+        if not name:
+            continue
+
+        # KEY FIX: preserve domain exactly — never force-add a dot prefix.
+        # Host-only cookies (e.g. "www.tiktok.com") must stay as host-only;
+        # adding a dot changes browser behaviour and breaks TikTok auth.
         domain = c.get("domain", ".tiktok.com")
-        if not domain.startswith("."): domain = "." + domain
+        # Only add dot if it's genuinely a subdomain wildcard (tiktok.com → .tiktok.com)
+        # but NOT for explicit host cookies like www.tiktok.com
+        if domain and not domain.startswith(".") and domain.count(".") == 1:
+            domain = "." + domain
+
         path   = c.get("path", "/")
         secure = "TRUE" if c.get("secure") else "FALSE"
-        try:    expires = str(int(float(c.get("expirationDate") or c.get("expires") or 2147483647)))
-        except: expires = "2147483647"
-        name, value = c.get("name", ""), c.get("value", "")
-        if name:
-            lines.append(f"{domain}\tTRUE\t{path}\t{secure}\t{expires}\t{name}\t{value}")
-            count += 1
-    print(f"TikTok cookies: JSON→Netscape ({count} cookies).")
+        include_sub = "TRUE" if domain.startswith(".") else "FALSE"
+
+        # KEY FIX: don't force-revive expired cookies.
+        # Use the real expiry, or 9999999999 only for genuine session cookies
+        # (where expirationDate is absent/null, meaning no expiry set by server).
+        raw_exp = c.get("expirationDate") or c.get("expires")
+        if raw_exp is None:
+            # True session cookie — no server-set expiry
+            expires = "9999999999"
+        else:
+            try:
+                exp_int = int(float(raw_exp))
+                if exp_int <= 0:
+                    # Explicitly expired/invalid — skip it entirely
+                    skipped_expired += 1
+                    continue
+                expires = str(exp_int)
+            except (TypeError, ValueError):
+                expires = "9999999999"
+
+        lines.append(f"{domain}\t{include_sub}\t{path}\t{secure}\t{expires}\t{name}\t{value}")
+        count += 1
+
+    msg = f"TikTok cookies: JSON→Netscape ({count} cookies written"
+    if skipped_expired:
+        msg += f", {skipped_expired} expired skipped"
+    print(msg + ").")
+
 except Exception:
+    # Already in Netscape format — write as-is
     lines = raw.splitlines()
     count = sum(1 for l in lines if l and not l.startswith("#") and "\t" in l)
     print(f"TikTok cookies: written as-is ({count} Netscape rows).")
