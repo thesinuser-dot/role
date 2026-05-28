@@ -134,14 +134,15 @@ class GeminiWebBrowser:
 
     def _is_logged_in(self) -> bool:
         try:
-            url = self._page.url or ""
-            if "accounts.google.com" in url:
+            # If we're on the Google login page, definitely not logged in
+            if "accounts.google.com" in (self._page.url or ""):
                 return False
-            # Sign-in button present = not logged in
+            # If a sign-in button is explicitly visible, not logged in
             for sel in [
                 "a[href*='accounts.google.com/signin']",
                 "a[aria-label*='Sign in']",
-                "a[data-action='sign in']",
+                "button:has-text('Sign in')",
+                "a:has-text('Sign in')",
                 ".sign-in-button",
             ]:
                 try:
@@ -150,24 +151,8 @@ class GeminiWebBrowser:
                         return False
                 except Exception:
                     pass
-            # Prompt input present = logged in
-            for sel in [
-                "rich-textarea div[contenteditable='true']",
-                "div[contenteditable='true'][role='textbox']",
-                "ms-autosize-textarea textarea",
-                "textarea[placeholder]",
-                "div[contenteditable='true'][data-placeholder]",
-                "p[data-placeholder]",
-                "div[contenteditable='true']",
-            ]:
-                try:
-                    el = self._page.query_selector(sel)
-                    if el and el.is_visible():
-                        return True
-                except Exception:
-                    pass
-            # If none found, assume not logged in
-            return False
+            # No sign-in gate found — assume logged in
+            return True
         except Exception:
             return False
 
@@ -310,6 +295,25 @@ class GeminiWebBrowser:
         "button[jsname][aria-label*='add' i]",
     ]
 
+    def _close_any_open_dialog(self) -> None:
+        """Dismiss any open dialog/overlay that might be blocking the input."""
+        try:
+            page = self._page
+            for sel in ["button[aria-label='Close']", "button[aria-label='Cancel']",
+                        "[role='dialog'] button", "mat-dialog-container button"]:
+                try:
+                    el = page.query_selector(sel)
+                    if el and el.is_visible():
+                        el.click()
+                        time.sleep(0.5)
+                        break
+                except Exception:
+                    pass
+            page.keyboard.press("Escape")
+            time.sleep(0.5)
+        except Exception:
+            pass
+
     def _paste_image_into_gemini(self, image_bytes: bytes) -> bool:
         tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
         tmp_path = tmp.name
@@ -319,7 +323,44 @@ class GeminiWebBrowser:
                 f.write(image_bytes)
             page = self._page
 
-            # ── Layer 1: xclip/wl-copy clipboard + Ctrl+V ────────────────────
+            # ── Layer 1: file chooser intercepted via attach button ───────────
+            for btn_sel in self._ATTACH_BTN_SELS:
+                try:
+                    btn = page.query_selector(btn_sel)
+                    if not btn or not btn.is_visible():
+                        continue
+                    try:
+                        with page.expect_file_chooser(timeout=4_000) as fc_info:
+                            btn.click()
+                        fc_info.value.set_files(tmp_path)
+                        time.sleep(2)
+                        log.info(f"Image uploaded via file chooser ({btn_sel}) ✅")
+                        return True
+                    except Exception:
+                        # chooser didn't fire — try set_input_files directly after click
+                        time.sleep(0.5)
+                        for inp in page.query_selector_all("input[type='file']"):
+                            try:
+                                inp.set_input_files(tmp_path)
+                                time.sleep(2)
+                                log.info(f"Image uploaded via {btn_sel} + file input ✅")
+                                return True
+                            except Exception:
+                                continue
+                except Exception:
+                    continue
+
+            # ── Layer 2: direct set_input_files on all file inputs ───────────
+            for inp in page.query_selector_all("input[type='file']"):
+                try:
+                    inp.set_input_files(tmp_path)
+                    time.sleep(2)
+                    log.info("Image uploaded via hidden file input ✅")
+                    return True
+                except Exception:
+                    continue
+
+            # ── Layer 3: xclip/wl-copy clipboard + Ctrl+V (X11/Wayland) ─────
             if self._put_image_on_clipboard(image_bytes, tmp_path):
                 for sel in self._INPUT_SELS:
                     try:
@@ -334,83 +375,7 @@ class GeminiWebBrowser:
                     except Exception:
                         continue
 
-            # ── Layer 2: file chooser via attachment button ───────────────────
-            log.info("Clipboard paste failed — trying file chooser via attach button...")
-            for btn_sel in self._ATTACH_BTN_SELS:
-                try:
-                    btn = page.query_selector(btn_sel)
-                    if not btn:
-                        continue
-                    try:
-                        with page.expect_file_chooser(timeout=5_000) as fc_info:
-                            btn.click()
-                        fc_info.value.set_files(tmp_path)
-                        time.sleep(2)
-                        log.info(f"Image uploaded via file chooser ({btn_sel}) ✅")
-                        return True
-                    except Exception:
-                        # chooser didn't open — try direct set_input_files after click
-                        btn.click()
-                        time.sleep(1)
-                        for inp in page.query_selector_all("input[type='file']"):
-                            try:
-                                inp.set_input_files(tmp_path)
-                                time.sleep(2)
-                                log.info(f"Image uploaded via {btn_sel} + file input ✅")
-                                return True
-                            except Exception:
-                                continue
-                except Exception:
-                    continue
-
-            # ── Layer 3: direct set_input_files on all hidden file inputs ─────
-            log.info("Attach button failed — trying all hidden file inputs...")
-            for inp in page.query_selector_all("input[type='file']"):
-                try:
-                    inp.set_input_files(tmp_path)
-                    time.sleep(2)
-                    log.info("Image uploaded via hidden file input ✅")
-                    return True
-                except Exception:
-                    continue
-
-            # ── Layer 4: DataTransfer dispatch event ─────────────────────────
-            log.info("File inputs failed — trying DataTransfer drop event...")
-            try:
-                import base64 as _b64
-                b64 = _b64.b64encode(image_bytes).decode()
-                for sel in self._INPUT_SELS:
-                    try:
-                        el = page.query_selector(sel)
-                        if not el:
-                            continue
-                        ok = page.evaluate(f"""(el) => {{
-                            try {{
-                                const b64 = "{b64}";
-                                const bin = atob(b64);
-                                const arr = new Uint8Array(bin.length);
-                                for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-                                const blob = new Blob([arr], {{type: "image/png"}});
-                                const file = new File([blob], "screenshot.png", {{type: "image/png"}});
-                                const dt = new DataTransfer();
-                                dt.items.add(file);
-                                const ev = new ClipboardEvent("paste", {{
-                                    clipboardData: dt, bubbles: true, cancelable: true
-                                }});
-                                el.dispatchEvent(ev);
-                                return true;
-                            }} catch(e) {{ return false; }}
-                        }}""", el)
-                        if ok:
-                            time.sleep(2)
-                            log.info(f"Image injected via DataTransfer paste event ({sel}) ✅")
-                            return True
-                    except Exception:
-                        continue
-            except Exception as exc:
-                log.debug(f"DataTransfer dispatch failed: {exc}")
-
-            log.warning("Could not upload image to Gemini after all attempts — sending text-only.")
+            log.warning("Image upload failed — sending text-only prompt.")
             return False
         finally:
             try:
@@ -450,24 +415,21 @@ class GeminiWebBrowser:
             page.goto(GEMINI_URL, wait_until="domcontentloaded", timeout=30_000)
             time.sleep(3)
 
-            # 2. Login check — if not logged in, re-inject and reload once more
+            # 2. Login check
             if not self._is_logged_in():
-                log.warning("Gemini: not logged in after cookie injection — retrying with fresh inject + reload...")
-                injected2 = self._inject_cookies()
-                if injected2 > 0:
-                    page.reload(wait_until="domcontentloaded", timeout=20_000)
-                    time.sleep(3)
-
-            if not self._is_logged_in():
-                log.error("Gemini: still not logged in — GEMINI_COOKIES secret is missing or expired.")
-                snap = page.screenshot(type="jpeg", quality=80)
-                self._send_screenshot(snap, "❌ Gemini: not logged in — update GEMINI_COOKIES secret with fresh exported cookies")
-                return None, snap
+                log.warning("Gemini: cookies didn't authenticate — trying manual login...")
+                if not self._manual_login():
+                    log.error("Gemini: manual login also failed — cannot proceed.")
+                    snap = page.screenshot(type="jpeg", quality=80)
+                    self._send_screenshot(snap, "❌ Gemini: login failed — update GEMINI_COOKIES or set GEMINI_EMAIL/GEMINI_PASSWORD")
+                    return None, snap
 
             # 3. Paste reel screenshot FIRST
             if image_bytes:
                 log.info("Pasting reel screenshot into Gemini...")
                 self._paste_image_into_gemini(image_bytes)
+                # Dismiss any dialog/overlay left open by failed upload attempts
+                self._close_any_open_dialog()
                 time.sleep(1)
 
             # 4. Type prompt as ONE clean paragraph
