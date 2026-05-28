@@ -170,11 +170,13 @@ class TikTokPoster:
 
         self._cookies_path = self._resolve_cookies()
         if not self._cookies_path:
-            log.info("No TikTok cookies found — attempting login with email/password...")
-            if not self._manual_login_and_save_cookies():
-                log.error("TikTok login failed and no cookies configured — TikTok posting disabled.")
-                self.enabled = False
-                return
+            log.warning(
+                "No TikTok cookies configured "
+                "(set TIKTOK_COOKIES_FILE or TIKTOK_SESSION_ID) — "
+                "TikTok posting disabled."
+            )
+            self.enabled = False
+            return
 
         log.info(
             f"TikTokPoster ready (auth_mode={self._auth_mode}, "
@@ -521,7 +523,6 @@ class TikTokPoster:
             return False
 
         caption = _build_caption(reel_url, views, likes, extra_tags or [])
-        _login_attempted = False  # only try once per post() call
 
         for attempt in range(1, Config.TIKTOK_MAX_RETRIES + 1):
             try:
@@ -534,21 +535,10 @@ class TikTokPoster:
                 return True
 
             except Exception as exc:
-                err_str = str(exc).lower()
                 log.warning(
                     f"[TikTok] Upload attempt {attempt}/{Config.TIKTOK_MAX_RETRIES} "
                     f"failed: {exc}"
                 )
-                # On first failure always try login — don't wait for specific keywords.
-                # tiktok-uploader can throw generic errors (timeout, element not found)
-                # even when the real cause is expired cookies.
-                if not _login_attempted:
-                    _login_attempted = True
-                    log.info("[TikTok] First failure — attempting fresh login...")
-                    if self._manual_login_and_save_cookies():
-                        log.info("[TikTok] Login refreshed — retrying upload...")
-                        continue
-
                 if attempt < Config.TIKTOK_MAX_RETRIES:
                     sleep_s = 2 ** attempt
                     log.info(f"[TikTok] Retrying in {sleep_s}s...")
