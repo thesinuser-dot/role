@@ -43,6 +43,20 @@ _NOT_LOGGED_IN_URLS = (
     "checkconnection",
 )
 
+# URL patterns that mean Google has hard-blocked this browser/app from signing
+# in — retrying or entering a password will never work.  Only fresh cookies
+# exported from a real Chrome session will fix this.
+_BLOCKED_BROWSER_URLS = (
+    "disallowed_useragent",
+    "errorCode=disallowed",
+    "oauth2/v2/auth",           # OAuth redirect that ends in the blocked screen
+)
+_BLOCKED_BROWSER_TEXT = (
+    "couldn't sign you in",
+    "this browser or app may not be secure",
+    "couldn\u2019t sign you in",   # curly apostrophe variant
+)
+
 
 def _sanitize_cookie(c: dict, default_domain: str) -> dict:
     """
@@ -232,8 +246,41 @@ class GeminiWebBrowser:
 
     def _manual_login(self) -> bool:
         """
-        Log in to Gemini via Google account credentials.
+        Attempt to log in to Gemini via Google account credentials.
+
+        Google blocks automated browsers from the OAuth sign-in flow with the
+        "Couldn't sign you in — This browser or app may not be secure" screen.
+        When that screen is detected we abort immediately and instruct the user
+        to export cookies from a real Chrome session instead of wasting time
+        retrying a login that will never succeed.
+
+        Password-based login is kept as a last resort for cases where Google
+        hasn't yet blocked this UA, but the recommended path is always cookies.
         """
+        page = self._page
+
+        # Check if we've already hit the hard-blocked screen
+        try:
+            current_url  = page.url or ""
+            page_content = page.content().lower()
+
+            url_blocked  = any(p in current_url for p in _BLOCKED_BROWSER_URLS)
+            text_blocked = any(t in page_content for t in _BLOCKED_BROWSER_TEXT)
+
+            if url_blocked or text_blocked:
+                log.error(
+                    "Google blocked this browser from signing in "
+                    "('Couldn't sign you in — This browser or app may not be secure'). "
+                    "Password login will NOT work from an automated browser. "
+                    "FIX: export cookies from a real logged-in Chrome session on "
+                    "gemini.google.com using the Cookie-Editor extension, paste the "
+                    "JSON array as the GEMINI_COOKIES GitHub secret, then re-run."
+                )
+                return False
+        except Exception:
+            pass
+
+        # Fall back to password login (works only if Google hasn't blocked UA)
         try:
             from config import Config
             email    = Config.GEMINI_EMAIL.strip()
@@ -242,17 +289,33 @@ class GeminiWebBrowser:
             email = password = ""
 
         if not email or not password:
-            log.warning("GEMINI_EMAIL/GEMINI_PASSWORD not set — cannot manual login.")
+            log.warning(
+                "GEMINI_EMAIL/GEMINI_PASSWORD not set — cannot attempt password login. "
+                "Set the GEMINI_COOKIES secret with cookies exported from a real Chrome "
+                "session on gemini.google.com to authenticate without a password."
+            )
             return False
 
-        log.info("Attempting manual Google/Gemini login...")
+        log.info("Attempting manual Google/Gemini login (password fallback)...")
         try:
             from playwright.sync_api import TimeoutError as PWTimeout
-            page = self._page
 
             log.info("Gemini login step 1: opening gemini.google.com/app...")
             page.goto(GEMINI_URL, wait_until="domcontentloaded", timeout=30_000)
             time.sleep(3)
+
+            # Abort immediately if we hit the blocked-browser screen
+            try:
+                content = page.content().lower()
+                if any(t in content for t in _BLOCKED_BROWSER_TEXT) or \
+                   any(p in (page.url or "") for p in _BLOCKED_BROWSER_URLS):
+                    log.error(
+                        "Blocked-browser screen appeared after navigation. "
+                        "Password login cannot proceed — update GEMINI_COOKIES instead."
+                    )
+                    return False
+            except Exception:
+                pass
 
             log.info("Gemini login step 2: clicking Sign in...")
             for sel in [
@@ -266,6 +329,18 @@ class GeminiWebBrowser:
                 except PWTimeout:
                     continue
             time.sleep(2)
+
+            # Check again after clicking Sign in
+            try:
+                content = page.content().lower()
+                if any(t in content for t in _BLOCKED_BROWSER_TEXT):
+                    log.error(
+                        "Blocked-browser screen appeared after clicking Sign in. "
+                        "Update GEMINI_COOKIES secret with fresh Chrome cookies."
+                    )
+                    return False
+            except Exception:
+                pass
 
             log.info("Gemini login step 3: filling Google email...")
             page.wait_for_selector("input[type='email']", timeout=15_000)
@@ -470,7 +545,7 @@ class GeminiWebBrowser:
                 if not self._manual_login():
                     log.error("Gemini: manual login also failed — cannot proceed.")
                     snap = page.screenshot(type="jpeg", quality=80)
-                    self._send_screenshot(snap, "❌ Gemini: login failed — update GEMINI_COOKIES or set GEMINI_EMAIL/GEMINI_PASSWORD")
+                    self._send_screenshot(snap, "❌ Gemini: login failed.\n\nFIX: Export cookies from a logged-in Chrome session on gemini.google.com using the Cookie-Editor extension, paste the JSON array as the GEMINI_COOKIES GitHub secret, then re-run.\n\nPassword login does NOT work from automated browsers — Google blocks it.")
                     return None, snap
 
             if image_bytes:
