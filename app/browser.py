@@ -33,6 +33,7 @@ from playwright.sync_api import (
 )
 
 from config import Config
+from proxy_pool import ProxyPool
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -221,6 +222,19 @@ class BrowserManager:
         self._trace_dir: Optional[Path]          = None
         self._canvas_seed: int = random.randint(1, 0x7FFFFFFF)
 
+        # ── Proxy pool ─────────────────────────────────────────────────────────
+        self._proxy_pool: Optional[ProxyPool] = None
+        self._active_proxy: Optional[dict]    = None
+        if Config.WEBSHARE_API_KEY:
+            try:
+                self._proxy_pool = ProxyPool(
+                    api_key=Config.WEBSHARE_API_KEY,
+                    mode=Config.WEBSHARE_PROXY_MODE,
+                )
+                self.log.info(self._proxy_pool.summary())
+            except Exception as exc:
+                self.log.warning(f"ProxyPool init failed — running without proxy: {exc}")
+
     # ── Public properties ─────────────────────────────────────────────────────
 
     @property
@@ -360,6 +374,15 @@ class BrowserManager:
         self._pw = sync_playwright().start()
         _chromium_exe = os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")
 
+        # ── Proxy selection ────────────────────────────────────────────────────
+        self._active_proxy = None
+        if self._proxy_pool is not None:
+            self._active_proxy = self._proxy_pool.get_random()
+            if self._active_proxy:
+                self.log.info(f"Using proxy: {self._active_proxy['server']}")
+            else:
+                self.log.warning("ProxyPool returned no proxy — launching without proxy.")
+
         _common_args = [
             "--no-sandbox",
             "--disable-setuid-sandbox",
@@ -401,6 +424,8 @@ class BrowserManager:
             permissions=["notifications"],
             ignore_https_errors=True,
         )
+        if self._active_proxy:
+            _ctx_kwargs["proxy"] = self._active_proxy
 
         profile_dir = Config.CHROME_PROFILE_DIR.strip()
 
@@ -488,6 +513,20 @@ class BrowserManager:
                 self.log.warning(f"Error closing {name}: {exc}")
 
         # ── Proxy feedback ─────────────────────────────────────────────────────
+        # Clean shutdown = mark the proxy as healthy so it isn't penalised.
+        if self._proxy_pool is not None and self._active_proxy is not None:
+            self._proxy_pool.mark_success(self._active_proxy)
+            self.log.debug(f"Proxy marked success: {self._active_proxy['server']}")
+
+    def mark_proxy_failed(self) -> None:
+        """
+        Call this from the agent when a navigation error suggests the proxy
+        is broken (connection refused, SSL error, bot-block page, etc.).
+        Quarantines the current proxy and picks a new one for the next launch.
+        """
+        if self._proxy_pool is not None and self._active_proxy is not None:
+            self._proxy_pool.mark_failed(self._active_proxy)
+            self.log.warning(f"Proxy marked failed: {self._active_proxy['server']}")
     def delay(self, lo_ms: int = 400, hi_ms: int = 1800) -> None:
         time.sleep(random.randint(lo_ms, hi_ms) / 1000)
 
