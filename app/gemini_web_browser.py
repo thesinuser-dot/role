@@ -154,7 +154,11 @@ class GeminiWebBrowser:
             for sel in [
                 "rich-textarea div[contenteditable='true']",
                 "div[contenteditable='true'][role='textbox']",
+                "ms-autosize-textarea textarea",
                 "textarea[placeholder]",
+                "div[contenteditable='true'][data-placeholder]",
+                "p[data-placeholder]",
+                "div[contenteditable='true']",
             ]:
                 try:
                     el = self._page.query_selector(sel)
@@ -281,133 +285,132 @@ class GeminiWebBrowser:
         log.warning("xclip and wl-copy both unavailable.")
         return False
 
+    # Selectors for the Gemini prompt input — ordered most-specific first
+    _INPUT_SELS = [
+        "rich-textarea div[contenteditable='true']",
+        "div[contenteditable='true'][role='textbox']",
+        "div.ql-editor[contenteditable='true']",
+        "ms-autosize-textarea textarea",
+        "textarea.input-area",
+        "textarea[placeholder]",
+        "div[contenteditable='true'][data-placeholder]",
+        "p[data-placeholder]",
+        "div[contenteditable='true']",
+    ]
+
+    # Selectors for the upload / attach button
+    _ATTACH_BTN_SELS = [
+        "button[aria-label*='Upload' i]",
+        "button[aria-label*='Add image' i]",
+        "button[aria-label*='attach' i]",
+        "button[aria-label*='image' i]",
+        "button[data-test-id*='attach' i]",
+        "[role='button'][aria-label*='Upload' i]",
+        "[role='button'][aria-label*='attach' i]",
+        "button[jsname][aria-label*='add' i]",
+    ]
+
     def _paste_image_into_gemini(self, image_bytes: bytes) -> bool:
-        import base64 as _b64
         tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
         tmp_path = tmp.name
         tmp.close()
         try:
+            with open(tmp_path, "wb") as f:
+                f.write(image_bytes)
             page = self._page
 
-            # ── Layer 1: xclip clipboard + Ctrl+V ────────────────────────────
-            clipboard_ok = self._put_image_on_clipboard(image_bytes, tmp_path)
-            if clipboard_ok:
-                _INPUT_SELS = [
-                    "rich-textarea div[contenteditable='true']",
-                    "div[contenteditable='true'][role='textbox']",
-                    "div.ql-editor[contenteditable='true']",
-                    "textarea[placeholder]",
-                    "div[contenteditable='true']",
-                ]
-                for sel in _INPUT_SELS:
+            # ── Layer 1: xclip/wl-copy clipboard + Ctrl+V ────────────────────
+            if self._put_image_on_clipboard(image_bytes, tmp_path):
+                for sel in self._INPUT_SELS:
                     try:
-                        el = page.wait_for_selector(sel, timeout=5_000)
+                        el = page.wait_for_selector(sel, timeout=4_000)
                         if el and el.is_visible():
                             el.click()
                             time.sleep(0.3)
                             page.keyboard.press("Control+v")
                             time.sleep(2)
-                            # Verify something was actually pasted (image chip appears)
-                            try:
-                                page.wait_for_selector(
-                                    "img[src^='blob:'], [data-test-id='image-chip'], "
-                                    ".image-chip, [aria-label*='image' i]",
-                                    timeout=3_000,
-                                )
-                            except Exception:
-                                pass  # best-effort verification
-                            log.info("Reel screenshot pasted via Ctrl+V ✅")
+                            log.info("Image pasted via xclip Ctrl+V ✅")
                             return True
                     except Exception:
                         continue
 
-            # ── Layer 2: JS clipboard API injection ───────────────────────────
-            # Inject the image directly into the page clipboard via JS so the
-            # browser's own paste handler picks it up — works even when xclip
-            # isn't installed or the X11 clipboard is sandboxed.
-            log.info("Clipboard paste failed — trying JS clipboard injection...")
-            try:
-                b64 = _b64.b64encode(image_bytes).decode()
-                injected = page.evaluate(f"""async () => {{
-                    try {{
-                        const b64 = "{b64}";
-                        const bin = atob(b64);
-                        const arr = new Uint8Array(bin.length);
-                        for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-                        const blob = new Blob([arr], {{type: "image/png"}});
-                        await navigator.clipboard.write([
-                            new ClipboardItem({{"image/png": blob}})
-                        ]);
-                        return true;
-                    }} catch(e) {{ return false; }}
-                }}""")
-                if injected:
-                    for sel in [
-                        "rich-textarea div[contenteditable='true']",
-                        "div[contenteditable='true'][role='textbox']",
-                        "div[contenteditable='true']",
-                    ]:
-                        try:
-                            el = page.wait_for_selector(sel, timeout=5_000)
-                            if el and el.is_visible():
-                                el.click()
-                                time.sleep(0.3)
-                                page.keyboard.press("Control+v")
-                                time.sleep(2)
-                                log.info("Reel screenshot pasted via JS clipboard injection ✅")
-                                return True
-                        except Exception:
-                            continue
-            except Exception as js_exc:
-                log.debug(f"JS clipboard injection failed: {js_exc}")
-
-            # ── Layer 3: hidden file input (set_input_files bypasses visibility) ─
-            log.info("JS clipboard failed — trying file input upload...")
-            try:
-                # Try ALL input[type=file] elements, including hidden ones.
-                # Playwright's set_input_files works on hidden inputs directly.
-                all_inputs = page.query_selector_all("input[type='file']")
-                for inp in all_inputs:
+            # ── Layer 2: file chooser via attachment button ───────────────────
+            log.info("Clipboard paste failed — trying file chooser via attach button...")
+            for btn_sel in self._ATTACH_BTN_SELS:
+                try:
+                    btn = page.query_selector(btn_sel)
+                    if not btn:
+                        continue
                     try:
-                        inp.set_input_files(tmp_path)
+                        with page.expect_file_chooser(timeout=5_000) as fc_info:
+                            btn.click()
+                        fc_info.value.set_files(tmp_path)
                         time.sleep(2)
-                        log.info("Image uploaded via hidden file input ✅")
+                        log.info(f"Image uploaded via file chooser ({btn_sel}) ✅")
                         return True
                     except Exception:
-                        continue
-            except Exception:
-                pass
+                        # chooser didn't open — try direct set_input_files after click
+                        btn.click()
+                        time.sleep(1)
+                        for inp in page.query_selector_all("input[type='file']"):
+                            try:
+                                inp.set_input_files(tmp_path)
+                                time.sleep(2)
+                                log.info(f"Image uploaded via {btn_sel} + file input ✅")
+                                return True
+                            except Exception:
+                                continue
+                except Exception:
+                    continue
 
-            # ── Layer 4: click attachment button, then set file input ──────────
-            log.info("Trying attachment button click + file input...")
+            # ── Layer 3: direct set_input_files on all hidden file inputs ─────
+            log.info("Attach button failed — trying all hidden file inputs...")
+            for inp in page.query_selector_all("input[type='file']"):
+                try:
+                    inp.set_input_files(tmp_path)
+                    time.sleep(2)
+                    log.info("Image uploaded via hidden file input ✅")
+                    return True
+                except Exception:
+                    continue
+
+            # ── Layer 4: DataTransfer dispatch event ─────────────────────────
+            log.info("File inputs failed — trying DataTransfer drop event...")
             try:
-                for btn_sel in [
-                    "button[aria-label*='attach' i]",
-                    "button[aria-label*='upload' i]",
-                    "button[aria-label*='image' i]",
-                    "button[data-test-id*='attach' i]",
-                    "[role='button'][aria-label*='attach' i]",
-                ]:
+                import base64 as _b64
+                b64 = _b64.b64encode(image_bytes).decode()
+                for sel in self._INPUT_SELS:
                     try:
-                        btn = page.query_selector(btn_sel)
-                        if btn:
-                            btn.click()
-                            time.sleep(1)
-                            all_inputs = page.query_selector_all("input[type='file']")
-                            for inp in all_inputs:
-                                try:
-                                    inp.set_input_files(tmp_path)
-                                    time.sleep(2)
-                                    log.info(f"Image uploaded via {btn_sel} + file input ✅")
-                                    return True
-                                except Exception:
-                                    continue
+                        el = page.query_selector(sel)
+                        if not el:
+                            continue
+                        ok = page.evaluate(f"""(el) => {{
+                            try {{
+                                const b64 = "{b64}";
+                                const bin = atob(b64);
+                                const arr = new Uint8Array(bin.length);
+                                for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+                                const blob = new Blob([arr], {{type: "image/png"}});
+                                const file = new File([blob], "screenshot.png", {{type: "image/png"}});
+                                const dt = new DataTransfer();
+                                dt.items.add(file);
+                                const ev = new ClipboardEvent("paste", {{
+                                    clipboardData: dt, bubbles: true, cancelable: true
+                                }});
+                                el.dispatchEvent(ev);
+                                return true;
+                            }} catch(e) {{ return false; }}
+                        }}""", el)
+                        if ok:
+                            time.sleep(2)
+                            log.info(f"Image injected via DataTransfer paste event ({sel}) ✅")
+                            return True
                     except Exception:
                         continue
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug(f"DataTransfer dispatch failed: {exc}")
 
-            log.warning("Could not paste or upload image to Gemini after all attempts.")
+            log.warning("Could not upload image to Gemini after all attempts — sending text-only.")
             return False
         finally:
             try:
@@ -471,15 +474,9 @@ class GeminiWebBrowser:
             clean_prompt = " ".join(prompt.split())[:4000]
 
             typed = False
-            for sel in [
-                "rich-textarea div[contenteditable='true']",
-                "div[contenteditable='true'][role='textbox']",
-                "div.ql-editor[contenteditable='true']",
-                "textarea[placeholder]",
-                "div[contenteditable='true']",
-            ]:
+            for sel in self._INPUT_SELS:
                 try:
-                    el = page.wait_for_selector(sel, timeout=10_000)
+                    el = page.wait_for_selector(sel, timeout=8_000)
                     if el and el.is_visible():
                         el.click()
                         time.sleep(0.4)
@@ -506,14 +503,21 @@ class GeminiWebBrowser:
             for _ in range(30):
                 time.sleep(1)
                 for sel in [
-                    "model-response", ".model-response-text",
-                    "message-content", "[data-testid='response']",
+                    "model-response .markdown",
+                    "model-response",
+                    "message-content .markdown",
+                    "message-content",
+                    ".response-content",
+                    ".model-response-text",
+                    "[data-testid='response']",
+                    "ms-cmark-node",
+                    ".gemini-response-text",
                 ]:
                     try:
                         els = page.query_selector_all(sel)
                         if els:
                             text = els[-1].inner_text()
-                            if text and len(text.strip()) > 5:
+                            if text and len(text.strip()) > 2:
                                 response_text = text.strip()
                                 break
                     except Exception:
