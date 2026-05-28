@@ -2,13 +2,12 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # gemini_web_browser.py — Gemini Web fallback reusing the existing browser tab
 #
-# Fix log:
-#   • sameSite values from JSON exports (no_restriction, lax, etc.) are
-#     sanitized to Playwright-legal values (Strict|Lax|None) before inject.
-#   • Never opens a new tab — reuses the injected existing page.
-#   • Cookie inject → login check → manual login fallback if needed.
-#   • Pastes reel screenshot via clipboard (xclip/wl-copy) FIRST, then
-#     types the prompt as one clean paragraph.
+# Fixes applied (2026-05):
+#   • NEVER mutate host-only cookie domains — preserve exact domain from export
+#   • Validate required Google auth cookies before attempting login
+#   • Expanded login-failure detection (consent/ogs/myaccount/reauth/challenge)
+#   • sameSite values sanitised without touching domain field
+#   • Expired cookies stay expired — no forced 2147483647 revival
 # ─────────────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
@@ -29,11 +28,31 @@ GOOGLE_LOGIN_URL = "https://accounts.google.com/signin/v2/identifier"
 # Playwright only accepts these three sameSite values
 _VALID_SAME_SITE = {"Strict", "Lax", "None"}
 
+# These cookies must be present for Gemini to authenticate reliably
+_REQUIRED_GEMINI_COOKIES = {"__Secure-1PSID", "SAPISID", "SID"}
+
+# URL patterns that indicate Google is NOT showing the chat UI
+_NOT_LOGGED_IN_URLS = (
+    "accounts.google.com",
+    "consent.google.com",
+    "ogs.google.com/widget",
+    "myaccount.google.com",
+    "challenge",
+    "reauth",
+    "signin",
+    "checkconnection",
+)
+
 
 def _sanitize_cookie(c: dict, default_domain: str) -> dict:
     """
     Normalise a raw cookie dict so Playwright's add_cookies() won't crash.
-    Fixes: sameSite, expires, domain, missing fields.
+
+    KEY FIX: Domain is preserved exactly as exported.
+    Prepending a dot to host-only cookies (e.g. accounts.google.com →
+    .accounts.google.com) changes browser behaviour and breaks Google auth.
+    We only add a leading dot when the original domain is genuinely a
+    subdomain wildcard (already starts with dot) OR when no domain is given.
     """
     # sameSite: map any export value → Strict | Lax | None
     raw_ss = str(c.get("sameSite") or c.get("same_site") or "").lower().replace("_", "").replace("-", "")
@@ -42,23 +61,27 @@ def _sanitize_cookie(c: dict, default_domain: str) -> dict:
     elif raw_ss == "lax":
         same_site = "Lax"
     else:
-        same_site = "None"   # 'no_restriction', 'unspecified', empty → None
+        same_site = "None"  # 'no_restriction', 'unspecified', empty → None
 
-    # expires: must be a positive int; some exports use float or -1
-    raw_exp = c.get("expirationDate") or c.get("expires") or 2147483647
+    # expires: must be a positive int; keep -1/None as session cookie
+    raw_exp = c.get("expirationDate") or c.get("expires")
     try:
-        expires = int(float(raw_exp))
+        expires = int(float(raw_exp)) if raw_exp is not None else -1
+        # Don't force-revive expired cookies — keep them as-is so Google
+        # sees the real expiry instead of a bogus far-future timestamp
         if expires <= 0:
-            expires = 2147483647
+            expires = -1
     except (TypeError, ValueError):
-        expires = 2147483647
+        expires = -1
 
-    # domain: must start with dot for host-cookies
+    # ── KEY FIX: preserve domain exactly; never force-add a dot prefix ──
     domain = str(c.get("domain") or default_domain)
-    if domain and not domain.startswith(".") and not domain.startswith("http"):
-        domain = "." + domain.lstrip(".")
+    # Only strip "http(s)://" prefixes — never add/remove dots
+    if domain.startswith("http"):
+        from urllib.parse import urlparse
+        domain = urlparse(domain).hostname or default_domain
 
-    return {
+    cookie: dict = {
         "name":     str(c.get("name", "")),
         "value":    str(c.get("value", "")),
         "domain":   domain,
@@ -66,8 +89,12 @@ def _sanitize_cookie(c: dict, default_domain: str) -> dict:
         "secure":   bool(c.get("secure", True)),
         "httpOnly": bool(c.get("httpOnly", False)),
         "sameSite": same_site,
-        "expires":  expires,
     }
+    # Only include 'expires' if it's a valid positive timestamp
+    if expires > 0:
+        cookie["expires"] = expires
+
+    return cookie
 
 
 class GeminiWebBrowser:
@@ -118,10 +145,30 @@ class GeminiWebBrowser:
                 }, ".google.com"))
         return cookies
 
+    def _validate_required_cookies(self, cookies: list) -> bool:
+        """
+        Check that the critical Google auth cookies are present.
+        Gemini silently redirects to login if any of these are missing.
+        """
+        present = {c["name"] for c in cookies}
+        missing = _REQUIRED_GEMINI_COOKIES - present
+        if missing:
+            log.warning(
+                f"Gemini cookies missing critical auth cookies: {missing}. "
+                "Login will likely fail. Export cookies from a fresh logged-in "
+                "Chrome session and ensure __Secure-1PSID, SAPISID, and SID are included."
+            )
+            return False
+        return True
+
     def _inject_cookies(self) -> int:
         cookies = self._parse_cookies()
         if not cookies or not self._ctx:
             return 0
+
+        # Warn if critical cookies are missing (but still try — partial is better than nothing)
+        self._validate_required_cookies(cookies)
+
         try:
             self._ctx.add_cookies(cookies)
             log.info(f"Injected {len(cookies)} Gemini cookie(s).")
@@ -133,10 +180,22 @@ class GeminiWebBrowser:
     # ── Login detection ───────────────────────────────────────────────────────
 
     def _is_logged_in(self) -> bool:
+        """
+        Check whether the current page is the Gemini chat UI.
+
+        KEY FIX: Google routes through many non-login URLs before showing
+        the chat. We check for ANY known gate/challenge URL, not just
+        accounts.google.com.
+        """
         try:
-            # If we're on the Google login page, definitely not logged in
-            if "accounts.google.com" in (self._page.url or ""):
-                return False
+            current_url = self._page.url or ""
+
+            # Any known Google auth/challenge URL = not logged in
+            for pattern in _NOT_LOGGED_IN_URLS:
+                if pattern in current_url:
+                    log.debug(f"Login check: gate URL detected ({pattern}) in {current_url}")
+                    return False
+
             # If a sign-in button is explicitly visible, not logged in
             for sel in [
                 "a[href*='accounts.google.com/signin']",
@@ -151,20 +210,29 @@ class GeminiWebBrowser:
                         return False
                 except Exception:
                     pass
-            # No sign-in gate found — assume logged in
-            return True
+
+            # Verify Gemini chat input is actually present
+            for sel in [
+                "rich-textarea div[contenteditable='true']",
+                "div[contenteditable='true'][role='textbox']",
+                "ms-autosize-textarea textarea",
+            ]:
+                try:
+                    el = self._page.query_selector(sel)
+                    if el and el.is_visible():
+                        return True
+                except Exception:
+                    pass
+
+            # No chat input found but no gate detected — uncertain; treat as not logged in
+            log.debug(f"Login check: no chat input found on {current_url}")
+            return False
         except Exception:
             return False
 
     def _manual_login(self) -> bool:
         """
-        Log in to Gemini via Google account:
-          1. Open gemini.google.com/app
-          2. Click the "Sign in" button
-          3. Fill Google email -> Next
-          4. Fill Google password -> Next
-          5. Verify Gemini chat UI is accessible
-        Credentials come from GEMINI_EMAIL / GEMINI_PASSWORD secrets.
+        Log in to Gemini via Google account credentials.
         """
         try:
             from config import Config
@@ -182,12 +250,10 @@ class GeminiWebBrowser:
             from playwright.sync_api import TimeoutError as PWTimeout
             page = self._page
 
-            # Step 1: go to Gemini and click "Sign in"
             log.info("Gemini login step 1: opening gemini.google.com/app...")
             page.goto(GEMINI_URL, wait_until="domcontentloaded", timeout=30_000)
             time.sleep(3)
 
-            # Step 2: click "Sign in" button if present
             log.info("Gemini login step 2: clicking Sign in...")
             for sel in [
                 "a:has-text('Sign in')",
@@ -201,7 +267,6 @@ class GeminiWebBrowser:
                     continue
             time.sleep(2)
 
-            # Step 3: Google email input
             log.info("Gemini login step 3: filling Google email...")
             page.wait_for_selector("input[type='email']", timeout=15_000)
             page.fill("input[type='email']", email)
@@ -209,7 +274,6 @@ class GeminiWebBrowser:
             page.keyboard.press("Enter")
             time.sleep(3)
 
-            # Step 4: Google password input
             log.info("Gemini login step 4: filling Google password...")
             page.wait_for_selector("input[type='password']", timeout=15_000)
             page.fill("input[type='password']", password)
@@ -217,7 +281,6 @@ class GeminiWebBrowser:
             page.keyboard.press("Enter")
             time.sleep(6)
 
-            # Step 5: redirect back to Gemini if needed
             if "gemini.google.com" not in page.url:
                 log.info("Gemini login step 5: navigating back to Gemini...")
                 page.goto(GEMINI_URL, wait_until="domcontentloaded", timeout=30_000)
@@ -225,7 +288,6 @@ class GeminiWebBrowser:
 
             if self._is_logged_in():
                 log.info("Manual Gemini login succeeded ✅")
-                # Save cookies back to context so they persist across queries
                 try:
                     cookies = page.context.cookies()
                     log.info(f"Gemini: captured {len(cookies)} cookies after login.")
@@ -244,7 +306,6 @@ class GeminiWebBrowser:
     def _put_image_on_clipboard(self, image_bytes: bytes, tmp_path: str) -> bool:
         with open(tmp_path, "wb") as f:
             f.write(image_bytes)
-        # Try xclip (X11)
         try:
             r = subprocess.run(
                 ["xclip", "-selection", "clipboard", "-t", "image/png", "-i", tmp_path],
@@ -255,7 +316,6 @@ class GeminiWebBrowser:
                 return True
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
-        # Try wl-copy (Wayland)
         try:
             with open(tmp_path, "rb") as f:
                 r2 = subprocess.run(
@@ -270,7 +330,6 @@ class GeminiWebBrowser:
         log.warning("xclip and wl-copy both unavailable.")
         return False
 
-    # Selectors for the Gemini prompt input — ordered most-specific first
     _INPUT_SELS = [
         "rich-textarea div[contenteditable='true']",
         "div[contenteditable='true'][role='textbox']",
@@ -283,7 +342,6 @@ class GeminiWebBrowser:
         "div[contenteditable='true']",
     ]
 
-    # Selectors for the upload / attach button
     _ATTACH_BTN_SELS = [
         "button[aria-label*='Upload' i]",
         "button[aria-label*='Add image' i]",
@@ -296,7 +354,6 @@ class GeminiWebBrowser:
     ]
 
     def _close_any_open_dialog(self) -> None:
-        """Dismiss any open dialog/overlay that might be blocking the input."""
         try:
             page = self._page
             for sel in ["button[aria-label='Close']", "button[aria-label='Cancel']",
@@ -323,7 +380,6 @@ class GeminiWebBrowser:
                 f.write(image_bytes)
             page = self._page
 
-            # ── Layer 1: file chooser intercepted via attach button ───────────
             for btn_sel in self._ATTACH_BTN_SELS:
                 try:
                     btn = page.query_selector(btn_sel)
@@ -337,7 +393,6 @@ class GeminiWebBrowser:
                         log.info(f"Image uploaded via file chooser ({btn_sel}) ✅")
                         return True
                     except Exception:
-                        # chooser didn't fire — try set_input_files directly after click
                         time.sleep(0.5)
                         for inp in page.query_selector_all("input[type='file']"):
                             try:
@@ -350,7 +405,6 @@ class GeminiWebBrowser:
                 except Exception:
                     continue
 
-            # ── Layer 2: direct set_input_files on all file inputs ───────────
             for inp in page.query_selector_all("input[type='file']"):
                 try:
                     inp.set_input_files(tmp_path)
@@ -360,7 +414,6 @@ class GeminiWebBrowser:
                 except Exception:
                     continue
 
-            # ── Layer 3: xclip/wl-copy clipboard + Ctrl+V (X11/Wayland) ─────
             if self._put_image_on_clipboard(image_bytes, tmp_path):
                 for sel in self._INPUT_SELS:
                     try:
@@ -395,7 +448,6 @@ class GeminiWebBrowser:
             log.error("No BrowserContext — call set_context() first.")
             return None, None
 
-        # Resolve page
         page = self._page
         if page is None:
             pages = self._ctx.pages
@@ -408,14 +460,11 @@ class GeminiWebBrowser:
                 return None, None
 
         try:
-            # 1. Inject cookies into context BEFORE navigating so Google
-            #    receives authenticated cookies on the very first request.
             injected = self._inject_cookies()
             log.info(f"Navigating to Gemini (existing tab, {injected} cookies pre-injected)...")
             page.goto(GEMINI_URL, wait_until="domcontentloaded", timeout=30_000)
             time.sleep(3)
 
-            # 2. Login check
             if not self._is_logged_in():
                 log.warning("Gemini: cookies didn't authenticate — trying manual login...")
                 if not self._manual_login():
@@ -424,15 +473,12 @@ class GeminiWebBrowser:
                     self._send_screenshot(snap, "❌ Gemini: login failed — update GEMINI_COOKIES or set GEMINI_EMAIL/GEMINI_PASSWORD")
                     return None, snap
 
-            # 3. Paste reel screenshot FIRST
             if image_bytes:
                 log.info("Pasting reel screenshot into Gemini...")
                 self._paste_image_into_gemini(image_bytes)
-                # Dismiss any dialog/overlay left open by failed upload attempts
                 self._close_any_open_dialog()
                 time.sleep(1)
 
-            # 4. Type prompt as ONE clean paragraph
             clean_prompt = " ".join(prompt.split())[:4000]
 
             typed = False
@@ -455,12 +501,10 @@ class GeminiWebBrowser:
                 self._send_screenshot(snap, "❌ Gemini Web: prompt input not found")
                 return None, snap
 
-            # 5. Submit
             time.sleep(0.5)
             page.keyboard.press("Enter")
             log.info("Prompt submitted — waiting for response...")
 
-            # 6. Wait for response
             response_text = None
             for _ in range(30):
                 time.sleep(1)
