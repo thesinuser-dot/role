@@ -182,6 +182,35 @@ class Config:
     COOKIES_FILE: Path = Path("/tmp/ig_cookies.txt")
 
 
+    # ── Proxy (Webshare.io) ────────────────────────────────────────────────────
+    # Set WEBSHARE_API_KEY to enable rotating residential/datacenter proxies.
+    # Leave empty to browse directly — the system-level VPN (Japan or otherwise)
+    # will be used by default since Playwright inherits OS network when no
+    # explicit proxy is configured.
+    #
+    # IMPORTANT — VPN coexistence:
+    #   When WEBSHARE_ENABLED=true (default when API key is present), Playwright
+    #   routes browser traffic through Webshare, which BYPASSES any system-level
+    #   VPN for that browser context.  Non-browser traffic (requests, yt-dlp,
+    #   Telegram) is unaffected and still goes through the VPN.
+    #
+    #   To keep using the system VPN for the browser:
+    #     • Leave WEBSHARE_API_KEY empty, OR
+    #     • Set WEBSHARE_ENABLED=false explicitly
+    #
+    # WEBSHARE_PROXY_MODE must match your Webshare plan:
+    #   "direct"   — datacenter / rotating proxies  (default, most plans)
+    #   "backbone" — residential backbone proxies   (premium plans)
+    WEBSHARE_API_KEY:    str  = os.environ.get("WEBSHARE_API_KEY",   "")
+    WEBSHARE_PROXY_MODE: str  = os.environ.get("WEBSHARE_PROXY_MODE", "direct")
+    # Explicit on/off override — defaults True when a key is present.
+    # Set WEBSHARE_ENABLED=false to keep the system VPN active even if a key is set.
+    WEBSHARE_ENABLED: bool = (
+        os.environ.get("WEBSHARE_ENABLED", "").strip().lower() == "true"
+        if os.environ.get("WEBSHARE_ENABLED", "").strip()
+        else bool(os.environ.get("WEBSHARE_API_KEY", ""))
+    )
+
     # ── Browser ────────────────────────────────────────────────────────────────
     HEADLESS: bool = os.environ.get("PLAYWRIGHT_HEADLESS", "false").strip().lower() == "true"
     VIEWPORT_W: int = int(os.environ.get("VIEWPORT_W", "430"))
@@ -289,6 +318,7 @@ class Config:
             f"|  TikTok enabled     : {cls.TIKTOK_ENABLED}",
             f"|  TikTok auth mode   : {cls.TIKTOK_AUTH_MODE if cls.TIKTOK_ENABLED else chr(110)+chr(47)+chr(97)}",
             f"|  Cookies set        : {bool(cls.INSTAGRAM_SESSION_COOKIES)}",
+            f"|  Proxy enabled      : {bool(cls.WEBSHARE_API_KEY)} (mode={cls.WEBSHARE_PROXY_MODE})",
             f"|  Chrome profile     : {cls.CHROME_PROFILE_DIR or chr(40)+chr(101)+chr(112)+chr(104)+chr(101)+chr(109)+chr(101)+chr(114)+chr(97)+chr(108)+chr(41)}",
             f"|  Cooldown initial   : {cls.PROVIDER_COOLDOWN_INITIAL}s  max={cls.PROVIDER_COOLDOWN_MAX}s",
             f"|  Target accounts    : {users_str}",
