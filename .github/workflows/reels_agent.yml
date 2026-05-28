@@ -433,6 +433,10 @@ jobs:
         env:
           INSTAGRAM_SESSION_COOKIES: ${{ secrets.INSTAGRAM_SESSION_COOKIES }}
           GEMINI_API_KEY:            ${{ secrets.GEMINI_API_KEY }}
+          OLLAMA_BASE_URL:            ${{ secrets.OLLAMA_BASE_URL }}
+          OLLAMA_MODEL:               llava
+          OLLAMA_TIMEOUT:             120
+          HF_TOKEN:                   ${{ secrets.HF_TOKEN }}
           GEMINI_COOKIES:            ${{ secrets.GEMINI_COOKIES }}
           GEMINI_EMAIL:              ${{ secrets.GEMINI_EMAIL }}
           GEMINI_PASSWORD:           ${{ secrets.GEMINI_PASSWORD }}
