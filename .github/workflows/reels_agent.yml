@@ -180,54 +180,58 @@ jobs:
 
           echo "Desktop ready -- http://localhost:${WEB_PORT}/"
 
-      - name: Start Ngrok tunnel and notify Telegram
+      - name: Start tunnel and notify Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          NGROK_AUTHTOKEN:    ${{ secrets.NGROK_AUTHTOKEN }}
         run: |
-          curl -sSL https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz \
-            | sudo tar -xz -C /usr/local/bin
-          ngrok config add-authtoken "$NGROK_AUTHTOKEN"
-          ngrok http ${WEB_PORT} --log=stdout --log-format=json \
-            --request-header-add "ngrok-skip-browser-warning:true" > /tmp/ngrok.log 2>&1 &
-          NGROK_PID=$!
-          echo "Ngrok started (PID=$NGROK_PID)"
+          # Generate a fresh SSH key so localhost.run accepts the connection
+          ssh-keygen -t ed25519 -f /tmp/tunnel_key -N "" -q
+          chmod 600 /tmp/tunnel_key
+
+          # Start localhost.run tunnel (no account or token needed)
+          # -o StrictHostKeyChecking=no avoids interactive host-key prompts in CI
+          ssh -i /tmp/tunnel_key \
+            -o StrictHostKeyChecking=no \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=100 \
+            -R 80:localhost:${WEB_PORT} \
+            nokey@localhost.run \
+            > /tmp/tunnel.log 2>&1 &
+          echo "Tunnel started (PID=$!)"
 
           python3 - << 'PYEOF'
-          import time, json, os, urllib.request, sys
+          import time, re, os, json, urllib.request, sys
 
           TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
           CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-          # Give ngrok a few seconds to establish the tunnel before polling
-          time.sleep(5)
-
+          # Wait for localhost.run to print the public URL to its log
           url = None
           for attempt in range(60):
               try:
-                  with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels", timeout=3) as r:
-                      d = json.load(r)
-                      t = d.get("tunnels", [])
-                      if t:
-                          url = t[0]["public_url"]
-                          break
+                  with open("/tmp/tunnel.log") as f:
+                      text = f.read()
+                  m = re.search(r"https://[a-z0-9\-]+\.lhr\.life", text)
+                  if m:
+                      url = m.group(0)
+                      break
               except Exception:
                   pass
               time.sleep(1)
 
           if not url:
-              print("ERROR: Ngrok tunnel not found after 60s")
+              print("ERROR: tunnel URL not found after 60s")
               try:
-                  with open("/tmp/ngrok.log") as f:
-                      print("=== ngrok log ===")
+                  with open("/tmp/tunnel.log") as f:
+                      print("=== tunnel log ===")
                       print(f.read()[-3000:])
               except Exception:
                   pass
               sys.exit(1)
 
           print(f"Tunnel ready: {url}")
-          with open("/tmp/ngrok_url", "w") as f:
+          with open("/tmp/tunnel_url", "w") as f:
               f.write(url)
 
           text = (
@@ -258,12 +262,11 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN:        ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:          ${{ secrets.TELEGRAM_CHAT_ID }}
-          NGROK_AUTHTOKEN:           ${{ secrets.NGROK_AUTHTOKEN }}
           INSTAGRAM_SESSION_COOKIES: ${{ secrets.INSTAGRAM_SESSION_COOKIES }}
           GEMINI_API_KEY:            ${{ secrets.GEMINI_API_KEY }}
         run: |
           python3 - << 'PYEOF'
-          import os, json, time, subprocess, urllib.request, sys
+          import os, json, time, re, subprocess, urllib.request, sys
 
           TOKEN    = os.environ["TELEGRAM_BOT_TOKEN"]
           CHAT_ID  = str(os.environ["TELEGRAM_CHAT_ID"]).strip()
@@ -293,38 +296,41 @@ jobs:
               except Exception as e:
                   print(f"[tg_send error] {e}")
 
-          def get_ngrok_url():
+          def get_tunnel_url():
               try:
-                  with open("/tmp/ngrok_url") as f:
+                  with open("/tmp/tunnel_url") as f:
                       return f.read().strip()
               except Exception:
                   pass
               try:
-                  with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels", timeout=3) as r:
-                      d = json.load(r)
-                      t = d.get("tunnels", [])
-                      if t:
-                          return t[0]["public_url"]
+                  with open("/tmp/tunnel.log") as f:
+                      m = re.search(r"https://[a-z0-9\-]+\.lhr\.life", f.read())
+                      if m:
+                          return m.group(0)
               except Exception:
                   pass
               return None
 
-          def restart_ngrok():
-              subprocess.run(["pkill", "ngrok"], capture_output=True)
+          def restart_tunnel():
+              subprocess.run(["pkill", "-f", "localhost.run"], capture_output=True)
               time.sleep(2)
               subprocess.Popen(
-                  ["ngrok", "http", WEB_PORT, "--log=stdout", "--log-format=json",
-                   "--request-header-add", "ngrok-skip-browser-warning:true"],
-                  stdout=open("/tmp/ngrok.log", "w"), stderr=subprocess.STDOUT
+                  ["ssh", "-i", "/tmp/tunnel_key",
+                   "-o", "StrictHostKeyChecking=no",
+                   "-o", "ServerAliveInterval=30",
+                   "-o", "ServerAliveCountMax=100",
+                   "-R", f"80:localhost:{WEB_PORT}",
+                   "nokey@localhost.run"],
+                  stdout=open("/tmp/tunnel.log", "w"), stderr=subprocess.STDOUT
               )
               time.sleep(15)
-              url = get_ngrok_url()
+              url = get_tunnel_url()
               if url:
-                  with open("/tmp/ngrok_url", "w") as f:
+                  with open("/tmp/tunnel_url", "w") as f:
                       f.write(url)
                   tg_send(f"New desktop link:\n\n{url}/\n\n/resume /newlink /desktop")
               else:
-                  tg_send("Failed to restart Ngrok.")
+                  tg_send("Failed to restart tunnel.")
 
           def cmd_desktop():
               env = os.environ.copy()
@@ -361,7 +367,7 @@ jobs:
                       sys.exit(0)
                   elif text.startswith("/newlink"):
                       tg_send("Restarting tunnel...")
-                      restart_ngrok()
+                      restart_tunnel()
                   elif text.startswith("/desktop"):
                       cmd_desktop()
 
@@ -411,14 +417,16 @@ jobs:
             echo "TIKTOK_COOKIES secret not set -- skipping."
           fi
 
-          # ── Gemini cookies ──────────────────────────────────────────────
-          # Write to file so the agent can re-read them if needed
+          # ── Gemini / Google cookies ─────────────────────────────────────
+          # Normalise via write_google_cookies.py (handles JSON array,
+          # semicolon string, and base64-encoded variants).
           if [ -n "$GEMINI_COOKIES" ]; then
-            echo "$GEMINI_COOKIES" > "$HOME/.secrets/gemini_cookies.json"
+            python3 .github/scripts/write_google_cookies.py
             chmod 600 "$HOME/.secrets/gemini_cookies.json"
-            echo "Gemini cookies written to $HOME/.secrets/gemini_cookies.json"
           else
-            echo "GEMINI_COOKIES secret not set -- Gemini Web will be disabled."
+            echo "GEMINI_COOKIES secret not set -- Gemini Web browser fallback will be disabled."
+            echo "To fix: export cookies from a logged-in Chrome tab on gemini.google.com"
+            echo "using the Cookie-Editor extension and paste the JSON as GEMINI_COOKIES."
           fi
 
       - name: Run Reels AI Hunter agent
