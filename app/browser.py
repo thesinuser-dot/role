@@ -342,6 +342,13 @@ class BrowserManager:
         """
         Launch Chromium with full stealth settings.
 
+        FIX 1 — Persistent Profile:
+        When Config.CHROME_PROFILE_DIR is set, launch_persistent_context() is
+        used instead of new_context().  This preserves IndexedDB, localStorage,
+        service-worker registrations, and browser history across sessions so
+        Gemini and TikTok see a long-lived real identity rather than a fresh VM.
+        Set CHROME_PROFILE_DIR=/data/chrome-profile in your environment to enable.
+
         cookies: optional list of Playwright-format cookie dicts.
         If omitted, cookies are parsed from Config.INSTAGRAM_SESSION_COOKIES.
         """
@@ -349,51 +356,42 @@ class BrowserManager:
             cookies = self._parse_cookies(Config.INSTAGRAM_SESSION_COOKIES)
         ua = random.choice(Config.USER_AGENTS)
 
-        # ── Proxy selection ────────────────────────────────────────────────────
-
         self.log.info(f"Launching Chromium (headless={Config.HEADLESS}) UA={ua[:60]}...")
         self._pw = sync_playwright().start()
-        # Use system Chromium (with H.264/AAC codecs) when available in container
         _chromium_exe = os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")
-        self._browser = self._pw.chromium.launch(
-            executable_path=_chromium_exe or None,
-            headless=Config.HEADLESS,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-                                "--disable-site-isolation-trials",
-                "--disable-web-security",
-                "--disable-extensions",
-                "--disable-default-apps",
-                "--disable-infobars",
-                "--disable-notifications",
-                "--disable-popup-blocking",
-                "--disable-hang-monitor",
-                "--disable-renderer-backgrounding",
-                "--disable-backgrounding-occluded-windows",
-                "--disable-client-side-phishing-detection",
-                "--metrics-recording-only",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--password-store=basic",
-                "--use-mock-keychain",
-                # ── Video playback ─────────────────────────────────────────
-                # Instagram serves H.264/AAC — ensure software decode is on
-                "--autoplay-policy=no-user-gesture-required",
-                "--enable-features=MediaFoundationH264Encoding",
-                "--disable-features=VizDisplayCompositor,IsolateOrigins,LegacyTLSEnforced",
-                "--force-color-profile=srgb",
-                "--enable-accelerated-video-decode",
-                "--enable-gpu-rasterization",
-                # ── Avoid triggering CDN bot-detection ─────────────────────
-                # Remove the explicit UA from args — it's set in context below,
-                # having it in both places sometimes creates a mismatch header
-                f"--window-size={Config.VIEWPORT_W},{Config.VIEWPORT_H}",
-            ],
-        )
-        self._ctx = self._browser.new_context(
+
+        _common_args = [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-site-isolation-trials",
+            "--disable-web-security",
+            "--disable-extensions",
+            "--disable-default-apps",
+            "--disable-infobars",
+            "--disable-notifications",
+            "--disable-popup-blocking",
+            "--disable-hang-monitor",
+            "--disable-renderer-backgrounding",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-client-side-phishing-detection",
+            "--metrics-recording-only",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--password-store=basic",
+            "--use-mock-keychain",
+            # Instagram serves H.264/AAC — ensure software decode is on
+            "--autoplay-policy=no-user-gesture-required",
+            "--enable-features=MediaFoundationH264Encoding",
+            "--disable-features=VizDisplayCompositor,IsolateOrigins,LegacyTLSEnforced",
+            "--force-color-profile=srgb",
+            "--enable-accelerated-video-decode",
+            "--enable-gpu-rasterization",
+            f"--window-size={Config.VIEWPORT_W},{Config.VIEWPORT_H}",
+        ]
+
+        _ctx_kwargs = dict(
             viewport={"width": Config.VIEWPORT_W, "height": Config.VIEWPORT_H},
             user_agent=ua,
             locale="en-US",
@@ -403,6 +401,34 @@ class BrowserManager:
             permissions=["notifications"],
             ignore_https_errors=True,
         )
+
+        profile_dir = Config.CHROME_PROFILE_DIR.strip()
+
+        if profile_dir:
+            # ── Persistent profile (FIX 1) ─────────────────────────────────────
+            # launch_persistent_context() combines browser launch + context in
+            # one call.  The on-disk profile outlives the process — TikTok and
+            # Gemini treat it as a real long-lived device, not a fresh headless VM.
+            Path(profile_dir).mkdir(parents=True, exist_ok=True)
+            self.log.info(f"Using persistent Chrome profile: {profile_dir}")
+            self._ctx = self._pw.chromium.launch_persistent_context(
+                user_data_dir=profile_dir,
+                executable_path=_chromium_exe or None,
+                headless=Config.HEADLESS,
+                args=_common_args,
+                **_ctx_kwargs,
+            )
+            self._browser = None  # no separate browser handle with persistent context
+        else:
+            # ── Ephemeral context (original fallback) ──────────────────────────
+            self.log.info("CHROME_PROFILE_DIR not set — using ephemeral context.")
+            self._browser = self._pw.chromium.launch(
+                executable_path=_chromium_exe or None,
+                headless=Config.HEADLESS,
+                args=_common_args,
+            )
+            self._ctx = self._browser.new_context(**_ctx_kwargs)
+
         self._ctx.add_init_script(_build_stealth_script(self._canvas_seed))
         if cookies:
             self._ctx.add_cookies(cookies)
