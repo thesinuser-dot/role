@@ -187,6 +187,21 @@ class Config:
     VIEWPORT_W: int = int(os.environ.get("VIEWPORT_W", "430"))
     VIEWPORT_H: int = int(os.environ.get("VIEWPORT_H", "932"))
 
+    # Persistent Chrome profile directory.
+    # When set, the browser reuses the same IndexedDB, localStorage, service
+    # workers, and profile history across sessions — Gemini and TikTok both
+    # trust long-lived profiles far more than fresh ephemeral contexts.
+    # Example: CHROME_PROFILE_DIR=/data/chrome-profile
+    # Leave empty to use the old ephemeral new_context() behaviour.
+    CHROME_PROFILE_DIR: str = os.environ.get("CHROME_PROFILE_DIR", "")
+
+    # ── Provider quota backoff ─────────────────────────────────────────────────
+    # Base cooldown (seconds) after the first quota hit.  Doubles on every
+    # subsequent failure up to PROVIDER_COOLDOWN_MAX (exponential backoff).
+    # Formula: min(MAX, INITIAL * 2^(failure_count - 1))
+    PROVIDER_COOLDOWN_INITIAL: int = int(os.environ.get("PROVIDER_COOLDOWN_INITIAL", "300"))
+    PROVIDER_COOLDOWN_MAX: int     = int(os.environ.get("PROVIDER_COOLDOWN_MAX",     "3600"))
+
     USER_AGENTS: List[str] = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -274,6 +289,8 @@ class Config:
             f"|  TikTok enabled     : {cls.TIKTOK_ENABLED}",
             f"|  TikTok auth mode   : {cls.TIKTOK_AUTH_MODE if cls.TIKTOK_ENABLED else chr(110)+chr(47)+chr(97)}",
             f"|  Cookies set        : {bool(cls.INSTAGRAM_SESSION_COOKIES)}",
+            f"|  Chrome profile     : {cls.CHROME_PROFILE_DIR or chr(40)+chr(101)+chr(112)+chr(104)+chr(101)+chr(109)+chr(101)+chr(114)+chr(97)+chr(108)+chr(41)}",
+            f"|  Cooldown initial   : {cls.PROVIDER_COOLDOWN_INITIAL}s  max={cls.PROVIDER_COOLDOWN_MAX}s",
             f"|  Target accounts    : {users_str}",
             f"|  Caption blacklist  : {len(cls.CAPTION_BLACKLIST)} words",
             f"|  Caption whitelist  : {len(cls.CAPTION_WHITELIST)} words",
