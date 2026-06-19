@@ -402,32 +402,98 @@ jobs:
 
       - name: Write cookies files
         env:
-          TIKTOK_COOKIES: ${{ secrets.TIKTOK_COOKIES }}
           GEMINI_COOKIES: ${{ secrets.GEMINI_COOKIES }}
         run: |
           mkdir -p "$HOME/.secrets"
 
-          # ── TikTok cookies ──────────────────────────────────────────────
-          # agent.py expects Netscape tab-separated format, but the secret is
-          # typically JSON from a browser extension.  Normalise here.
-          if [ -n "$TIKTOK_COOKIES" ]; then
-            python3 .github/scripts/write_tt_cookies.py
-            chmod 600 "$HOME/.secrets/tiktok_cookies.txt"
-          else
-            echo "TIKTOK_COOKIES secret not set -- skipping."
-          fi
-
           # ── Gemini / Google cookies ─────────────────────────────────────
-          # Normalise via write_google_cookies.py (handles JSON array,
-          # semicolon string, and base64-encoded variants).
           if [ -n "$GEMINI_COOKIES" ]; then
             python3 .github/scripts/write_google_cookies.py
             chmod 600 "$HOME/.secrets/gemini_cookies.json"
           else
             echo "GEMINI_COOKIES secret not set -- Gemini Web browser fallback will be disabled."
-            echo "To fix: export cookies from a logged-in Chrome tab on gemini.google.com"
-            echo "using the Cookie-Editor extension and paste the JSON as GEMINI_COOKIES."
           fi
+
+      - name: Validate Instagram session cookies
+        env:
+          INSTAGRAM_SESSION_COOKIES: ${{ secrets.INSTAGRAM_SESSION_COOKIES }}
+          TELEGRAM_BOT_TOKEN:        ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:          ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python3 - << 'PYEOF'
+          import os, json, time, urllib.request
+
+          raw = os.environ.get("INSTAGRAM_SESSION_COOKIES", "").strip()
+          token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+          chat  = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+          def tg(msg):
+              if not (token and chat):
+                  return
+              data = json.dumps({"chat_id": chat, "text": msg, "parse_mode": "HTML"}).encode()
+              try:
+                  urllib.request.urlopen(
+                      urllib.request.Request(
+                          f"https://api.telegram.org/bot{token}/sendMessage",
+                          data=data, headers={"Content-Type": "application/json"}
+                      ), timeout=10
+                  )
+              except Exception as e:
+                  print(f"tg send err: {e}")
+
+          if not raw:
+              print("⚠️  INSTAGRAM_SESSION_COOKIES is empty — agent will likely fail.")
+              tg("⚠️ <b>INSTAGRAM_SESSION_COOKIES is empty</b>\nPlease set it in GitHub Secrets.")
+              raise SystemExit(0)  # non-fatal, let agent handle it
+
+          # Parse cookies
+          try:
+              cookies = json.loads(raw) if raw.startswith("[") else []
+          except Exception:
+              cookies = []
+
+          if not cookies:
+              print("⚠️  Could not parse cookies as JSON array — might be semicolon format.")
+          else:
+              # Check for critical IG session cookies
+              names = {c.get("name","") for c in cookies}
+              critical = {"sessionid", "csrftoken", "ds_user_id"}
+              missing  = critical - names
+              if missing:
+                  msg = (
+                      f"⚠️ <b>Instagram cookies missing critical fields</b>\n\n"
+                      f"Missing: <code>{', '.join(sorted(missing))}</code>\n\n"
+                      "The agent may fail with a splash screen.\n"
+                      "Please export fresh cookies from EditThisCookie."
+                  )
+                  print(msg.replace("<b>","").replace("</b>","").replace("<code>","").replace("</code>",""))
+                  tg(msg)
+              else:
+                  # Check sessionid expiry
+                  now = int(time.time())
+                  for c in cookies:
+                      if c.get("name") == "sessionid":
+                          exp = c.get("expirationDate") or c.get("expires") or 0
+                          try:
+                              exp = int(float(exp))
+                          except Exception:
+                              exp = 0
+                          days_left = (exp - now) // 86400
+                          if exp and exp < now:
+                              msg = (
+                                  "🔴 <b>Instagram sessionid cookie is EXPIRED</b>\n\n"
+                                  "This is why Instagram shows the splash screen forever.\n\n"
+                                  "<b>Fix:</b> Log in to instagram.com → EditThisCookie → Export → "
+                                  "update <code>INSTAGRAM_SESSION_COOKIES</code> secret."
+                              )
+                              print("EXPIRED sessionid cookie detected!")
+                              tg(msg)
+                          elif days_left < 7:
+                              tg(f"⚠️ Instagram sessionid expires in <b>{days_left} days</b> — refresh soon.")
+                          else:
+                              print(f"✅ sessionid valid — expires in ~{days_left} days")
+                          break
+          PYEOF
 
       - name: Run Reels AI Hunter agent
         env:
@@ -442,10 +508,7 @@ jobs:
           GEMINI_PASSWORD:           ${{ secrets.GEMINI_PASSWORD }}
           TELEGRAM_BOT_TOKEN:        ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:          ${{ secrets.TELEGRAM_CHAT_ID }}
-          TIKTOK_SESSION_COOKIES:    ${{ secrets.TIKTOK_SESSION_COOKIES }}
-          TIKTOK_COOKIES_FILE:       /home/runner/.secrets/tiktok_cookies.txt
-          TIKTOK_EMAIL:              ${{ secrets.TIKTOK_EMAIL }}
-          TIKTOK_PASSWORD:           ${{ secrets.TIKTOK_PASSWORD }}
+          TIKTOK_ACCESS_TOKEN:       ${{ secrets.TIKTOK_ACCESS_TOKEN }}
           GH_TOKEN:                  ${{ secrets.GH_TOKEN || github.token }}
           B2_APPLICATION_KEY_ID:     ${{ secrets.B2_APPLICATION_KEY_ID }}
           B2_APPLICATION_KEY:        ${{ secrets.B2_APPLICATION_KEY }}
