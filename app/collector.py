@@ -667,16 +667,108 @@ class ReelCollector:
             time.sleep(0.5)
         return False
 
+    _SPLASH_ESCAPE_STRATEGIES = [
+        # (description, js_or_action)
+        ("Hard reload",            "reload"),
+        ("Navigate to home first", "home"),
+        ("Navigate via /explore/", "explore"),
+    ]
+
+    def _escape_splash(self, attempt: int, notifier=None) -> bool:
+        """
+        Try progressively more aggressive strategies to break out of the
+        Instagram splash/loading screen.  Returns True if feed content appears.
+        """
+        strategies = self._SPLASH_ESCAPE_STRATEGIES
+        strat = strategies[min(attempt - 1, len(strategies) - 1)]
+        label, action = strat
+        self.log.info(f"Splash escape strategy: [{label}]")
+
+        try:
+            if action == "reload":
+                self._page.reload(wait_until="domcontentloaded", timeout=30_000)
+                self._bm.delay(4000, 6000)
+
+            elif action == "home":
+                # Navigate to IG home first, wait, then go to /reels/
+                self._page.goto(
+                    "https://www.instagram.com/",
+                    wait_until="domcontentloaded", timeout=30_000
+                )
+                self._bm.delay(3000, 5000)
+                self.dismiss_popups()
+                if not self._is_splash_screen():
+                    self.log.info("Home page loaded — navigating to /reels/")
+                self._page.goto(
+                    Config.INSTAGRAM_REELS_URL,
+                    wait_until="domcontentloaded", timeout=30_000
+                )
+                self._bm.delay(3000, 5000)
+
+            elif action == "explore":
+                self._page.goto(
+                    "https://www.instagram.com/explore/",
+                    wait_until="domcontentloaded", timeout=30_000
+                )
+                self._bm.delay(3000, 5000)
+                self.dismiss_popups()
+                self._page.goto(
+                    Config.INSTAGRAM_REELS_URL,
+                    wait_until="domcontentloaded", timeout=30_000
+                )
+                self._bm.delay(3000, 5000)
+
+        except Exception as exc:
+            self.log.warning(f"Splash escape [{label}] raised: {exc}")
+            return False
+
+        self.dismiss_popups()
+
+        # Check if we escaped
+        still_splash = self._is_splash_screen()
+        if not still_splash:
+            self.log.info(f"Splash escape [{label}] succeeded ✅")
+            return True
+
+        # Check for login redirect (cookies rejected)
+        url = self._page.url
+        if "accounts/login" in url or "/login" in url:
+            self.log.error("Instagram redirected to login — cookies are expired/invalid!")
+            if notifier:
+                notifier.send_message(
+                    "🔴 <b>Instagram session expired</b>\n\n"
+                    "Redirected to login page after splash escape.\n"
+                    "Please refresh <code>INSTAGRAM_SESSION_COOKIES</code> in GitHub Secrets.\n\n"
+                    "<b>How to get fresh cookies:</b>\n"
+                    "1. Log in to instagram.com in Chrome\n"
+                    "2. Use the EditThisCookie extension → Export\n"
+                    "3. Paste the JSON into the <code>INSTAGRAM_SESSION_COOKIES</code> secret"
+                )
+            return False
+
+        if notifier:
+            try:
+                snap = self._page.screenshot(type="jpeg", quality=65)
+                notifier.send_debug(
+                    f"⚠️ <b>Splash escape [{label}] — still loading</b>\n"
+                    f"URL: <code>{url}</code>",
+                    snap,
+                )
+            except Exception:
+                pass
+
+        return False
+
     def navigate_to_reels_feed(self, notifier=None) -> bool:
         self.log.info(f"Navigating to {Config.INSTAGRAM_REELS_URL}")
 
-        MAX_RETRIES = 3
+        MAX_RETRIES = 4
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 self._page.goto(
                     Config.INSTAGRAM_REELS_URL, wait_until="domcontentloaded", timeout=30_000
                 )
-                self._bm.delay(2500, 4000)
+                self._bm.delay(3000, 5000)
                 url = self._page.url
                 self.log.info(f"Attempt {attempt}: Landed on: {url}")
 
@@ -696,43 +788,56 @@ class ReelCollector:
                 if self._is_splash_screen():
                     self.log.warning(
                         f"Attempt {attempt}: Instagram splash screen detected "
-                        "(logo-only page, no feed content). Waiting for feed to load..."
+                        "(logo-only, no feed content). Waiting 15s for natural load..."
                     )
-                    # Give it up to 20s to transition to the real feed
-                    feed_appeared = self._wait_for_feed(timeout_s=20)
+                    # Give it 15s to transition on its own
+                    feed_appeared = self._wait_for_feed(timeout_s=15)
 
                     if not feed_appeared:
                         self.log.warning(
-                            f"Attempt {attempt}: Feed did not appear after 20s. "
-                            "Trying a hard reload..."
+                            f"Attempt {attempt}: Still on splash after 15s — "
+                            "trying escape strategy..."
                         )
                         if notifier and attempt == 1:
                             try:
                                 snap = self._page.screenshot(type="jpeg", quality=65)
                                 notifier.send_debug(
-                                    f"⚠️ <b>Splash screen on attempt {attempt}</b> — reloading...\n"
-                                    f"URL: <code>{url}</code>",
+                                    f"⚠️ <b>Splash screen stuck (attempt {attempt})</b>\n"
+                                    f"URL: <code>{url}</code>\n"
+                                    "Trying escape strategy...",
                                     snap,
                                 )
                             except Exception:
                                 pass
 
-                        try:
-                            self._page.reload(wait_until="domcontentloaded", timeout=30_000)
-                            self._bm.delay(3000, 5000)
-                            self.dismiss_popups()
-                            if not self._wait_for_feed(timeout_s=15):
-                                self.log.warning(
-                                    f"Attempt {attempt}: Feed still not visible after reload."
-                                )
-                                if attempt < MAX_RETRIES:
-                                    self._bm.delay(4000, 6000)
-                                    continue  # retry full navigation
-                        except Exception as exc:
-                            self.log.warning(f"Attempt {attempt}: Reload failed: {exc}")
+                        escaped = self._escape_splash(attempt, notifier)
+                        if not escaped:
                             if attempt < MAX_RETRIES:
-                                self._bm.delay(3000, 5000)
+                                self._bm.delay(4000, 7000)
                                 continue
+                            else:
+                                # Final attempt failed — warn about cookies
+                                self.log.error(
+                                    "All attempts stuck on splash screen. "
+                                    "This almost always means Instagram cookies are "
+                                    "expired or being rejected. "
+                                    "Please refresh INSTAGRAM_SESSION_COOKIES."
+                                )
+                                if notifier:
+                                    notifier.send_message(
+                                        "🔴 <b>Instagram splash screen — all attempts failed</b>\n\n"
+                                        "The page shows the Instagram logo and never loads.\n\n"
+                                        "This almost always means your session cookies are "
+                                        "<b>expired or rejected</b> by Instagram.\n\n"
+                                        "<b>Fix:</b>\n"
+                                        "1. Open instagram.com in Chrome while logged in\n"
+                                        "2. Install <b>EditThisCookie</b> extension\n"
+                                        "3. Click Export → copy the JSON\n"
+                                        "4. Update <code>INSTAGRAM_SESSION_COOKIES</code> "
+                                        "in your GitHub repo Secrets"
+                                    )
+                                return False
+                        # escaped successfully — fall through to video check
 
                 # ── Confirm video elements ────────────────────────────────────
                 try:
