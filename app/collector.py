@@ -613,56 +613,163 @@ class ReelCollector:
 
     # ── Navigation ────────────────────────────────────────────────────────────
 
+    # Selectors that confirm the real Reels feed has loaded (not the splash screen)
+    _FEED_READY_SELECTORS: List[str] = [
+        "video",
+        "article",
+        "[role='main'] a[href*='/reel/']",
+        "main",
+        "svg[aria-label='Reels']",
+    ]
+
+    def _is_splash_screen(self) -> bool:
+        """
+        Return True if Instagram is showing the loading splash screen
+        (just the logo on a white/dark page, no real content).
+        Detection: body has very few elements AND no video/article/main content.
+        """
+        try:
+            # If any feed-ready selector is present, it's NOT a splash screen
+            for sel in self._FEED_READY_SELECTORS:
+                try:
+                    el = self._page.query_selector(sel)
+                    if el and el.is_visible():
+                        return False
+                except Exception:
+                    pass
+
+            # Count all meaningful DOM nodes — splash screen has very few
+            node_count = self._page.evaluate(
+                "() => document.querySelectorAll('div, span, a, img, video, article').length"
+            )
+            self.log.debug(f"Splash-screen check: node_count={node_count}")
+            return node_count < 30  # splash = ~10 nodes; real feed = 200+
+
+        except Exception as exc:
+            self.log.debug(f"Splash-screen detection error (assuming not splash): {exc}")
+            return False
+
+    def _wait_for_feed(self, timeout_s: int = 20) -> bool:
+        """
+        Wait up to timeout_s seconds for the real Reels feed to render.
+        Returns True if feed content appeared, False if still stuck on splash.
+        """
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            for sel in self._FEED_READY_SELECTORS:
+                try:
+                    el = self._page.query_selector(sel)
+                    if el and el.is_visible():
+                        self.log.info(f"Feed ready — detected: {sel!r}")
+                        return True
+                except Exception:
+                    pass
+            time.sleep(0.5)
+        return False
+
     def navigate_to_reels_feed(self, notifier=None) -> bool:
         self.log.info(f"Navigating to {Config.INSTAGRAM_REELS_URL}")
-        try:
-            self._page.goto(
-                Config.INSTAGRAM_REELS_URL, wait_until="domcontentloaded", timeout=30_000
-            )
-            self._bm.delay(2500, 4500)
-            url = self._page.url
-            self.log.info(f"Landed on: {url}")
 
-            if notifier:
-                try:
-                    snap = self._page.screenshot(type="jpeg", quality=70)
-                    page_title = self._page.title()
-                    notifier.send_debug(
-                        f"🌐 <b>Landed on:</b> <code>{url}</code>\n"
-                        f"📄 <b>Page title:</b> {page_title}",
-                        snap,
-                    )
-                except Exception as exc:
-                    self.log.debug(f"Landing snapshot failed: {exc}")
-
-            if "accounts/login" in url or "/login" in url:
-                self.log.error("Redirected to login page — session cookies are invalid/expired!")
-                if notifier:
-                    notifier.send_message(
-                        "<b>Reels Hunter — Session Expired</b>\n\n"
-                        "Instagram redirected to login.\n"
-                        "Please update <code>INSTAGRAM_SESSION_COOKIES</code>."
-                    )
-                return False
-
-            self.dismiss_popups()
-
+        MAX_RETRIES = 3
+        for attempt in range(1, MAX_RETRIES + 1):
             try:
-                self._page.wait_for_selector("video", timeout=12_000)
-                self.log.info("Video elements detected — Reels feed is live.")
-            except PlaywrightTimeout:
-                self.log.warning("No <video> found within 12s — proceeding anyway.")
+                self._page.goto(
+                    Config.INSTAGRAM_REELS_URL, wait_until="domcontentloaded", timeout=30_000
+                )
+                self._bm.delay(2500, 4000)
+                url = self._page.url
+                self.log.info(f"Attempt {attempt}: Landed on: {url}")
 
-            return True
+                if "accounts/login" in url or "/login" in url:
+                    self.log.error("Redirected to login page — session cookies are invalid/expired!")
+                    if notifier:
+                        notifier.send_message(
+                            "<b>Reels Hunter — Session Expired</b>\n\n"
+                            "Instagram redirected to login.\n"
+                            "Please update <code>INSTAGRAM_SESSION_COOKIES</code>."
+                        )
+                    return False
 
-        except PlaywrightError as exc:
-            self.log.error(f"Navigation PlaywrightError: {exc}")
-            if notifier:
-                notifier.send_debug(f"❌ Navigation error:\n<pre>{str(exc)[:400]}</pre>")
-            return False
-        except Exception as exc:
-            self.log.error(f"Navigation unexpected error: {exc}")
-            return False
+                self.dismiss_popups()
+
+                # ── Splash-screen detection ───────────────────────────────────
+                if self._is_splash_screen():
+                    self.log.warning(
+                        f"Attempt {attempt}: Instagram splash screen detected "
+                        "(logo-only page, no feed content). Waiting for feed to load..."
+                    )
+                    # Give it up to 20s to transition to the real feed
+                    feed_appeared = self._wait_for_feed(timeout_s=20)
+
+                    if not feed_appeared:
+                        self.log.warning(
+                            f"Attempt {attempt}: Feed did not appear after 20s. "
+                            "Trying a hard reload..."
+                        )
+                        if notifier and attempt == 1:
+                            try:
+                                snap = self._page.screenshot(type="jpeg", quality=65)
+                                notifier.send_debug(
+                                    f"⚠️ <b>Splash screen on attempt {attempt}</b> — reloading...\n"
+                                    f"URL: <code>{url}</code>",
+                                    snap,
+                                )
+                            except Exception:
+                                pass
+
+                        try:
+                            self._page.reload(wait_until="domcontentloaded", timeout=30_000)
+                            self._bm.delay(3000, 5000)
+                            self.dismiss_popups()
+                            if not self._wait_for_feed(timeout_s=15):
+                                self.log.warning(
+                                    f"Attempt {attempt}: Feed still not visible after reload."
+                                )
+                                if attempt < MAX_RETRIES:
+                                    self._bm.delay(4000, 6000)
+                                    continue  # retry full navigation
+                        except Exception as exc:
+                            self.log.warning(f"Attempt {attempt}: Reload failed: {exc}")
+                            if attempt < MAX_RETRIES:
+                                self._bm.delay(3000, 5000)
+                                continue
+
+                # ── Confirm video elements ────────────────────────────────────
+                try:
+                    self._page.wait_for_selector("video", timeout=12_000)
+                    self.log.info("Video elements detected — Reels feed is live.")
+                except PlaywrightTimeout:
+                    self.log.warning("No <video> found within 12s — proceeding anyway.")
+
+                # ── Success snapshot ──────────────────────────────────────────
+                if notifier:
+                    try:
+                        snap = self._page.screenshot(type="jpeg", quality=70)
+                        page_title = self._page.title()
+                        notifier.send_debug(
+                            f"🌐 <b>Feed ready (attempt {attempt})</b>\n"
+                            f"URL: <code>{self._page.url}</code>\n"
+                            f"📄 Title: {page_title}",
+                            snap,
+                        )
+                    except Exception as exc:
+                        self.log.debug(f"Landing snapshot failed: {exc}")
+
+                return True
+
+            except PlaywrightError as exc:
+                self.log.error(f"Attempt {attempt}: Navigation PlaywrightError: {exc}")
+                if attempt == MAX_RETRIES and notifier:
+                    notifier.send_debug(f"❌ Navigation error:\n<pre>{str(exc)[:400]}</pre>")
+                if attempt < MAX_RETRIES:
+                    self._bm.delay(3000, 5000)
+            except Exception as exc:
+                self.log.error(f"Attempt {attempt}: Navigation unexpected error: {exc}")
+                if attempt < MAX_RETRIES:
+                    self._bm.delay(3000, 5000)
+
+        self.log.error(f"All {MAX_RETRIES} navigation attempts failed.")
+        return False
 
     # ── Reel URL collection ───────────────────────────────────────────────────
 
@@ -719,8 +826,32 @@ class ReelCollector:
             try:
                 self._page.evaluate("() => { document.body && document.body.focus(); }")
                 self._bm.delay(100, 200)
-                safe_x = max(10, Config.VIEWPORT_W // 6)
-                self._page.mouse.click(safe_x, 60)
+
+                # Prefer clicking the actual video element — most reliable focus
+                clicked_video = False
+                for sel in SelectorRegistry.VIDEO_ELEMENT:
+                    try:
+                        el = self._page.query_selector(sel)
+                        if el and el.is_visible():
+                            box = el.bounding_box()
+                            if box and box["width"] > 10 and box["height"] > 10:
+                                # Click the centre of the video
+                                cx = box["x"] + box["width"] / 2
+                                cy = box["y"] + box["height"] / 2
+                                self._page.mouse.click(cx, cy)
+                                self.log.debug(f"Focus: clicked video at ({cx:.0f},{cy:.0f})")
+                                clicked_video = True
+                                break
+                    except Exception:
+                        pass
+
+                if not clicked_video:
+                    # Fallback: click centre of viewport (avoids top bar at y=60)
+                    cx = Config.VIEWPORT_W / 2
+                    cy = Config.VIEWPORT_H / 2
+                    self._page.mouse.click(cx, cy)
+                    self.log.debug(f"Focus: fallback click at ({cx:.0f},{cy:.0f})")
+
                 self._bm.delay(200, 400)
                 self._page.evaluate("() => { document.body && document.body.focus(); }")
                 self._page.keyboard.press("Escape")
@@ -832,6 +963,18 @@ class ReelCollector:
                     f"refocus #{stuck_refocus_count})"
                 )
                 _focus_player()
+
+                # Every other refocus attempt, also try a mouse-wheel nudge
+                # to wake up the feed in case ArrowDown lost keyboard focus
+                if stuck_refocus_count % 2 == 0:
+                    try:
+                        self._page.mouse.wheel(0, 200)
+                        self._bm.delay(300, 600)
+                        self._page.mouse.wheel(0, -200)
+                        self._bm.delay(200, 400)
+                        self.log.debug("Stuck fallback: mouse-wheel nudge applied")
+                    except Exception as exc:
+                        self.log.debug(f"Mouse-wheel nudge failed: {exc}")
 
                 if stuck_refocus_count % 2 == 0 and notifier:
                     try:
